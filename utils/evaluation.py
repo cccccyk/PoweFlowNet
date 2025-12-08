@@ -27,7 +27,7 @@ def load_model(
         device = torch.device(device)
 
     try:
-        saved = torch.load(SAVE_MODEL_PATH, map_location=device)
+        saved = torch.load(SAVE_MODEL_PATH, map_location=device, weights_only=False)
         model.load_state_dict(saved['model_state_dict'])
     except FileNotFoundError:
         print("File not found. Could not load saved model.")

@@ -9,7 +9,7 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from datasets.PowerFlowData import PowerFlowData, random_bus_type
-from networks.MPN import MPN, MPN_simplenet, SkipMPN, MaskEmbdMPN, MultiConvNet, MultiMPN, MaskEmbdMultiMPN , MaskEmbdMultiMPN_NNConv , MaskEmbdMultiMPN_GATv2,MaskEmbdMultiMPN_NNConv_v2,MaskEmbdMultiMPN_PhysicsAttn,MaskEmbdMultiMPN_TAG_NNConv 
+from networks.MPN import MPN, MPN_simplenet, SkipMPN, MaskEmbdMPN, MultiConvNet, MultiMPN, MaskEmbdMultiMPN
 from utils.argument_parser import argument_parser
 from utils.training import train_epoch, append_to_json
 from utils.evaluation import evaluate_epoch
@@ -35,12 +35,7 @@ def main():
         'MaskEmbdMPN': MaskEmbdMPN,
         'MultiConvNet': MultiConvNet,
         'MultiMPN': MultiMPN,
-        'MaskEmbdMultiMPN': MaskEmbdMultiMPN,
-        'MaskEmbdMultiMPN_NNConv': MaskEmbdMultiMPN_NNConv,
-        'MaskEmbdMultiMPN_GATv2':MaskEmbdMultiMPN_GATv2,
-        'MaskEmbdMultiMPN_NNConv_v2':MaskEmbdMultiMPN_NNConv_v2,
-        'MaskEmbdMultiMPN_PhysicsAttn':MaskEmbdMultiMPN_PhysicsAttn,
-        'MaskEmbdMultiMPN_TAG_NNConv':MaskEmbdMultiMPN_TAG_NNConv
+        'MaskEmbdMultiMPN': MaskEmbdMultiMPN
     }
     mixed_cases = ['118v2', '14v2']
 
@@ -74,7 +69,6 @@ def main():
                    config=args)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用的设备是: {device}")
     torch.manual_seed(1234)
     np.random.seed(1234)
     # torch.backends.cudnn.deterministic = True
@@ -141,7 +135,6 @@ def main():
     #                                                        verbose=True)
     # 学习率调整器，scheduler，可以动态的调整学习率
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, steps_per_epoch=len(train_loader), epochs=num_epochs)
-    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
     # Step 3: Train model
     # 先把初始的loss设置成一个很大的值，这样后面的都会比他现在的小

@@ -47,17 +47,25 @@ def train_epoch(
         float: The mean loss value over all the batches in the DataLoader.
 
     """
+    # 加载model
     model = model.to(device)
+    # 初始loss是0
     total_loss = 0.
     num_samples = 0
+    # 训练模式
     model.train()
+    # 进度条
     pbar = tqdm(loader, total=len(loader), desc='Training')
+    # 开始一批一批的把数据送进去
     for data in pbar:
-        data = data.to(device) 
+        # 把数据放到GPU上面
+        data = data.to(device)
+        # 梯度清零 
         optimizer.zero_grad()
+        # 前向传播
         out = model(data)   # (N, 6), care about the first four. 
                             # data.y.shape == (N, 6)
-
+        # 这里是计算loss
         if isinstance(loss_fn, Masked_L2_loss):
             loss = loss_fn(out, data.y, data.pred_mask)
         elif isinstance(loss_fn, PowerImbalance):
@@ -70,9 +78,11 @@ def train_epoch(
             loss = loss_fn(out, data.edge_index, data.edge_attr, data.y)
         else:
             loss = loss_fn(out, data.y)
-
+        # 反向传播
         loss.backward()
+        # 更新权重
         optimizer.step()
+        # 更新训练的进度，以及一个epoch的平均loss
         num_samples += len(data)
         total_loss += loss.item() * len(data)
 

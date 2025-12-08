@@ -327,5 +327,37 @@ def main():
     # loss = loss_fn(sample.y, sample.edge_index, sample.edge_attr)
     print(loss)
     
+class Weighted_Masked_L2_loss(nn.Module):
+    """
+    针对不同物理量 (V, theta, P, Q) 赋予不同权重的 Loss
+    """
+    def __init__(self, weights=[1.0, 1.0, 1.0, 5.0]): 
+        # 默认给 Q (index 3) 5倍权重
+        super(Weighted_Masked_L2_loss, self).__init__()
+        self.weights = torch.tensor(weights)
+        self.criterion = nn.MSELoss(reduction='none') # 必须用 none，以便我们手动加权
+
+    def forward(self, output, target, mask):
+        # 1. 计算所有位置的平方误差
+        # shape: [Batch, N, 4]
+        squared_diff = (output - target) ** 2
+        
+        # 2. 确保权重在正确的设备上
+        if self.weights.device != output.device:
+            self.weights = self.weights.to(output.device)
+            
+        # 3. 应用权重
+        # weights shape: [4] -> 广播到 [Batch, N, 4]
+        # 让 Q 的误差被放大，P, V, Theta 保持原样
+        weighted_diff = squared_diff * self.weights 
+        
+        # 4. 应用掩码 (只计算未知量)
+        masked_loss = weighted_diff * mask
+        
+        # 5. 求平均
+        # 除以 mask 中 1 的总数，防止 loss 随 batch size 变大
+        loss = masked_loss.sum() / (mask.sum() + 1e-6)
+        
+        return loss
 if __name__ == '__main__':
     main()
