@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 from utils.custom_loss_functions import Masked_L2_loss
 import torch
-from datasets.PowerFlowData import PowerFlowData
+from datasets.PowerFlowData_copy import PowerFlowData
 # write file documentation here
 
 

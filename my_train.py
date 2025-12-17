@@ -8,7 +8,7 @@ from torch_geometric.loader import DataLoader
 
 from tqdm import tqdm
 
-from datasets.PowerFlowData import PowerFlowData, random_bus_type
+from datasets.PowerFlowData_copy import PowerFlowData, random_bus_type
 from networks.MPN import MPN, MPN_simplenet, SkipMPN, MaskEmbdMPN, MultiConvNet, MultiMPN, MaskEmbdMultiMPN
 from utils.argument_parser import argument_parser
 from utils.training import train_epoch, append_to_json

@@ -18,25 +18,22 @@ from torch_geometric.datasets import Planetoid
 feature_names_from_files = [
     'index',                # starting from 0 
     'type',                 # 
-    'e',    # 
-    'f', # 
+    'voltage magnitude',    # 
+    'voltage angle degree', # 
     'Pd',                   # 
     'Qd',                   # 
+    # 'Gs',                   # - equivalent to Pd, Qd                    8,
+    # 'Bs',                   # - equivalent to Pd, Qd                    9,
+    # 'Pg'                    # - removed
 ]
 
 # ok 对应的是使用edge_features的文件，其中该文件的一个向量有7位，其中只有前4位是有用的，分别代表from_bus,tu_bus,r,x
 edge_feature_names_from_files = [
     'from_bus',             # 
     'to_bus',               #
-    'g pu',                 # 
-    'b pu',                 # 
+    'r pu',                 # 
+    'x pu',                 # 
 ]
-def polar_to_rect(vm, va_degree):
-    """辅助函数：极坐标转直角坐标"""
-    va_rad = va_degree * np.pi / 180.0
-    e = vm * np.cos(va_rad)
-    f = vm * np.sin(va_rad)
-    return e, f
 
 # 数据增强函数，对于data中的bus_type，它会进行随机的变化，从而进行数据增强，哪怕是有问题的
 def random_bus_type(data: Data) -> Data:
@@ -120,7 +117,9 @@ class PowerFlowData(InMemoryDataset):   # 首先它集成来自于Geometric的In
         else:
             self.edgemean, self.edgestd = None, None
 
-
+        # 这一步把数据加载到内存，一个实例的数据就准备好了
+        # self.data, self.slices = self._normalize_dataset(
+        #     *torch.load(self.processed_paths[self.split_order[self.task]]))  # necessary, do not forget!
         loaded_data = torch.load(self.processed_paths[self.split_order[self.task]], weights_only=False)
         self.data, self.slices = self._normalize_dataset(*loaded_data)
 
@@ -134,27 +133,27 @@ class PowerFlowData(InMemoryDataset):   # 首先它集成来自于Geometric的In
         assert self.normalize == True   # 安全检查，如果一开始就没归一化，那么归一化也没意义
         return self.xymean[:1, :], self.xystd[:1, :], self.edgemean[:1, :], self.edgestd[:1, :]
 
-    def _normalize_dataset(self, data, slices):
+    # 这一步是执行归一化
+    def _normalize_dataset(self, data, slices, ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 如果在创建实例的时候设置了=False，这个函数会返回未修改的原始数据
         if not self.normalize:
+            # TODO an actual mask, perhaps never necessary though
             return data, slices
 
-        if self.xymean is None or self.xystd is None:
-            # data.y的结构是[P,Q,e,f]
-            xy = data.y 
+        # 这一段是在做节点数据的归一化
+        # normalizing
+        # for node attributes
+        if self.xymean is None or self.xystd is None:   # 只有当正在初始化trainset的时候，才会出现xymean是None的情况，
+            xy = data.y # name 'xy' is from legacy. Shape (N, 4)
             mean = torch.mean(xy, dim=0, keepdim=True)
             std = torch.std(xy, dim=0, keepdim=True)
-            
-            mean[:,2] = 0.0
-            mean[:,3] = 0.0
-            std[:,2] = 1.0
-            std[:,3] = 1.0
-
+            # 在构建训练集的时候，保存下来训练集的归一化的参数，包括 mean 和 std
             self.xymean, self.xystd = mean, std
-            print(f"✅ 已重置 e,f 的归一化参数: Mean={self.xymean}, Std={self.xystd}")
-
-        # 应用归一化
-        data.x = (data.x - self.xymean) / (self.xystd + 1e-7)
-        data.y = (data.y - self.xymean) / (self.xystd + 1e-7)
+            # + 0.0000001 to avoid NaN's because of division by zero
+        # 这一步是对节点的数据，包括输入的数据，以及label做归一化
+        data.x = (data.x - self.xymean) / (self.xystd + 0.0000001)
+        data.y = (data.y - self.xymean) / (self.xystd + 0.0000001)
+        # for edge attributes
 
         # 这一步对边的数据做归一化
         if self.edgemean is None or self.edgestd is None:
@@ -162,6 +161,13 @@ class PowerFlowData(InMemoryDataset):   # 首先它集成来自于Geometric的In
             std = torch.std(data.edge_attr, dim=0, keepdim=True)
             self.edgemean, self.edgestd = mean, std
         data.edge_attr = (data.edge_attr - self.edgemean) / (self.edgestd + 0.0000001)
+
+        # deprecated: adding the mask
+        # where x and y are unequal, the network must predict
+        # 1 where value changed, 0 where it did not change
+        # unequal = (data.x[:, 4:] != data.y).float()
+        # data.prediction_mask = unequal
+        # data.x = torch.concat([data.x, unequal], dim=1)
 
         return data, slices
     
@@ -176,9 +182,9 @@ class PowerFlowData(InMemoryDataset):   # 首先它集成来自于Geometric的In
     @property
     def processed_file_names(self) -> List[str]:
         return [
-            "case"+f"{self.case}"+"_processed_train_v4.pt",
-            "case"+f"{self.case}"+"_processed_val_v4.pt",
-            "case"+f"{self.case}"+"_processed_test_v4.pt",
+            "case"+f"{self.case}"+"_processed_train.pt",
+            "case"+f"{self.case}"+"_processed_val.pt",
+            "case"+f"{self.case}"+"_processed_test.pt",
         ]
     
     # 返回数据集中的图样本的总数
@@ -211,75 +217,30 @@ class PowerFlowData(InMemoryDataset):   # 首先它集成来自于Geometric的In
 
             # 循环创建各个集合
             for idx in range(len(split_edge_features)):
-
-                
-                # 把后四列输入给y
-                raw_y = split_node_features[idx][:, :, 2:] # shape (N, n_ndoes, 4); Vm, Va, P, Q
-                # 这一步是指把节点类型给选出来，后面的掩码要用到, 后面的话，要根据bus_type来做相应的掩码的工作
+                # shape of element in split_xx: [N, n_edges/n_nodes, n_features]
+                # for each case, process train, val, test split
+                # y是节点的所有的完整的特征
+                y = split_node_features[idx][:, :, 2:] # shape (N, n_ndoes, 4); Vm, Va, P, Q
+                # 这一步是对输入的数据做相应的掩码，生成输入的x向量
                 bus_type = split_node_features[idx][:, :, 1].type(torch.long) # shape (N, n_nodes)
-                
-                # 构建 true_y
-                vm_true = raw_y[:, :, 0]
-                va_true = raw_y[:, :, 1]
-                p_true = raw_y[:, :, 2]
-                q_true = raw_y[:, :, 3]
-
-                va_rad = va_true * (torch.pi / 180.0)
-                e_true = vm_true * torch.cos(va_rad)
-                f_true = vm_true * torch.sin(va_rad)
-
-                # 构建新的[P,Q,e,f]形式的y
-                y = torch.stack([p_true, q_true, e_true, f_true], dim=-1)
-                 # [新增] 哨兵打印！
+                bus_type_mask = torch.tensor(self.bus_type_mask)[bus_type] # shape (N, n_nodes, 4)
+                x = y.clone()*(1.-bus_type_mask) # shape (N, n_nodes, 4)
+                e = split_edge_features[idx] # shape (N, n_edges, 4)
+                # 遍历split后的每一个样本，转换为data对象
                 if idx == 0:
                     print("\n" + "!"*50)
                     print("DEBUG: 正在执行 PowerFlowData.process ...")
-                    print(f"DEBUG: 正在写入 target_vm, vm_true shape: {vm_true.shape}")
+                    print()
                     print("!"*50 + "\n")
-                
-                x = y.clone()
-                # 创建掩码，mask:1代表是自由变量，0代表是已知的
-                mask = torch.zeros_like(x)
-
-                # 用布尔变量来进行相应的掩码内容的填充
-                is_slack = (bus_type == 0)
-                is_pv = (bus_type == 1)
-                is_pq = (bus_type == 2)
-                
-                # 平衡节点节点,P,Q未知，但是后面的知道
-                x[is_slack,0] = 0.0
-                x[is_slack,1] = 0.0
-                mask[is_slack,0] = 1.0
-                mask[is_slack,1] = 1.0
-
-                # PV节点，P和V已知
-                x[is_pv,2] = vm_true[is_pv]
-                x[is_pv,3] = 0.0
-                x[is_pv,1] = 0.0
-                mask[is_pv,1] = 1.0
-                mask[is_pv,2] = 1.0
-                mask[is_pv,3] = 1.0
-
-                # PV节点，相角和Q是未知的，
-                x[is_pq,2] = 1.0
-                x[is_pq,3] = 0.0
-                mask[is_pq,2] = 1.0
-                mask[is_pq,3] = 1.0
-
-                # 获取边的特征
-                e_feat = split_edge_features[idx]
-
-                #转换为Data列表
                 data_list = [
                     Data(
                         x=x[i],
                         y=y[i],
                         bus_type=bus_type[i],
-                        pred_mask=mask[i],
-                        target_vm=vm_true[i],
-                        edge_index=e_feat[i,:,0:2].T.to(torch.long),
-                        edge_attr=e_feat[i,:,2:],
-                    )for i in range(len(x))
+                        pred_mask=bus_type_mask[i],
+                        edge_index=e[i, :, 0:2].T.to(torch.long),
+                        edge_attr=e[i, :, 2:],
+                    ) for i in range(len(x))
                 ]
 
                 if self.pre_filter is not None:  # filter out some data
@@ -298,13 +259,13 @@ class PowerFlowData(InMemoryDataset):   # 首先它集成来自于Geometric的In
 def main():
     try:
         # shape = (N, n_edges, 7)       (from, to, ...)
-        edge_features = np.load("data/raw/case118v3_edge_features.npy")
+        edge_features = np.load("data/raw/case118v2_edge_features.npy")
         # shape = (N, n_nodes, n_nodes)
-        adj_matrix = np.load("data/raw/case118v3_adjacency_matrix.npy")
+        adj_matrix = np.load("data/raw/case118v2_adjacency_matrix.npy")
         # shape = (N, n_nodes, 9)
-        node_features_x = np.load("data/raw/case118v3_node_features_x.npy")
+        node_features_x = np.load("data/raw/case118v2_node_features_x.npy")
         # shape = (N, n_nodes, 8)
-        node_features_y = np.load("data/raw/case118v3_node_features_y.npy")
+        node_features_y = np.load("data/raw/case118v2_node_features_y.npy")
     except FileNotFoundError:
         print("File not found.")
 

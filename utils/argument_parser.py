@@ -21,7 +21,7 @@ def argument_parser():
     parser.add_argument('--nfeature_dim', type=int, default=6, help='Number of node features')
     parser.add_argument('--efeature_dim', type=int, default=2, help='Number of edge features')
     parser.add_argument('--hidden_dim', type=int, default=128, help='Number of hidden features')
-    parser.add_argument('--output_dim', type=int, default=6, help='Number of output features')
+    parser.add_argument('--output_dim', type=int, default=2, help='Number of output features')
     parser.add_argument('--n_gnn_layers', type=int, default=4, help='Number of GNN layers')
     parser.add_argument('--K', type=int, default=3, help='Number of conv filter taps')
     parser.add_argument('--dropout_rate', type=float, default=0.2, help='Dropout rate')
@@ -34,8 +34,8 @@ def argument_parser():
     parser.add_argument('--data-dir', type=str, default='data', help='Path to data directory')
     parser.add_argument('--disable_normalize', default=False, action=argparse.BooleanOptionalAction, help='Disable normalizing data')
     parser.add_argument('--train_loss_fn', 
-                        type=str, default='Weighted_Masked_L2_loss', 
-                        choices=['masked_l2', 'power_imbalance', 'mse_loss', 'mixed_mse_power_imbalance','Weighted_Masked_L2_loss'],
+                        type=str, default='RectangularMixedLoss', 
+                        choices=['masked_l2', 'power_imbalance', 'mse_loss', 'mixed_mse_power_imbalance','Weighted_Masked_L2_loss','RectangularPureMSELoss','RectangularMixedLoss'],
                         help='Training loss function')
     parser.add_argument('--num-epochs', type=int, default=100, help='Number of epochs to train for')
     parser.add_argument('--batch-size', type=int, default=128, help='Batch size')

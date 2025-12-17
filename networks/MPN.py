@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import MessagePassing, TAGConv, GCNConv, ChebConv ,GATConv ,NNConv ,GATv2Conv
+from torch_geometric.nn import MessagePassing, TAGConv, GCNConv, ChebConv ,GATConv ,NNConv ,GATv2Conv ,GINEConv, LayerNorm, GENConv ,LayerNorm
 from torch_geometric.utils import degree ,softmax
 import torch.nn.functional as F
 
@@ -380,7 +380,6 @@ class MaskEmbdMPN(nn.Module):
         
         return x
 
-
 class MultiMPN(nn.Module):
     """Wrapped Message Passing Network
         - Multi-step mixed MP+Conv
@@ -461,7 +460,6 @@ class MultiMPN(nn.Module):
             x = self.layers[-1](x=x, edge_index=edge_index)
         
         return x
-
 
 class MaskEmbdMultiMPN(nn.Module):
     """Wrapped Message Passing Network
@@ -570,7 +568,6 @@ class MaskEmbdMultiMPN(nn.Module):
             x = self.layers[-1](x=x, edge_index=edge_index)
         
         return x
-    
     
 class MaskEmbdMultiMPN_NoMP(nn.Module):
     """Wrapped Message Passing Network
@@ -900,118 +897,115 @@ class MaskEmbdMultiMPN_NNConv(nn.Module):
         # NNConv 需要 (x, edge_index, edge_attr)
         for i in range(len(self.layers)-1):
             x = self.layers[i](x, edge_index, edge_features) 
-
             x = self.norms[i](x) # <--- 关键修改：在这里加归一化！
-
             x = self.dropout(x)
             x = nn.ReLU()(x)
-        
         # 6. 最后一层 (无激活函数)
         # 直接输出回归结果 (Vm, Va, P, Q)
         x = self.layers[-1](x, edge_index, edge_features)
 
         return x
-class MaskEmbdMultiMPN_GATv2(nn.Module):
+    
+class MaskEmbdMultiMPN_NNConv_v3(nn.Module):
     """
-    GATv2 architecture with Edge Features support.
-    Combines the best of both worlds:
-    1. Attention mechanism (Global/Topology awareness like TAGConv/Transformer)
-    2. Edge features integration (Physics awareness like NNConv)
+    [Improved NNConv with Residuals]
+    
+    Improvements over original:
+    1. Input Projection: Maps 4-dim input to hidden-dim immediately.
+    2. Residual Connections: x = x + block(x). Allows deeper networks (6-8 layers).
+    3. GELU Activation: Smoother gradients for regression.
     """
     def __init__(self, nfeature_dim, efeature_dim, output_dim, hidden_dim, n_gnn_layers, K, dropout_rate):
         super().__init__()
-        self.nfeature_dim = nfeature_dim
-        self.efeature_dim = efeature_dim
-        self.output_dim = output_dim
         self.hidden_dim = hidden_dim
-        self.n_gnn_layers = n_gnn_layers
         self.dropout_rate = dropout_rate
         
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-
-        # --- 关键参数: heads (多头注意力) ---
-        # 多头注意力能让模型同时关注不同的子空间（比如一个头关注电压，一个头关注相角）
-        heads = 4 
+        # --- 1. 输入投影层 ---
+        # 将原始特征 (P, Q, e, f) 映射到高维空间，方便后续处理
+        self.input_encoder = nn.Linear(nfeature_dim, hidden_dim)
         
-        # 1. 第一层 (Input -> Hidden)
-        # 注意: edge_dim=efeature_dim 是让它读取 r,x 的关键！
-        self.layers.append(GATv2Conv(nfeature_dim, hidden_dim // heads, 
-                                     heads=heads, 
-                                     edge_dim=efeature_dim, # <--- 注入物理参数
-                                     concat=True)) 
-        self.norms.append(nn.LayerNorm(hidden_dim))
-
-        # 2. 中间层 (Hidden -> Hidden)
-        for l in range(n_gnn_layers - 2):
-            self.layers.append(GATv2Conv(hidden_dim, hidden_dim // heads, 
-                                         heads=heads, 
-                                         edge_dim=efeature_dim, 
-                                         concat=True))
-            self.norms.append(nn.LayerNorm(hidden_dim))
-            
-        # 3. 最后一层 (Hidden -> Output)
-        # 输出层通常不使用多头拼接，而是取平均，或者 heads=1
-        self.layers.append(GATv2Conv(hidden_dim, output_dim, 
-                                     heads=1, 
-                                     edge_dim=efeature_dim, 
-                                     concat=False))
-        
+        # 掩码嵌入 (学习 "未知" 的含义)
         self.mask_embd = nn.Sequential(
             nn.Linear(nfeature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, nfeature_dim)
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
         )
-        self.dropout = nn.Dropout(self.dropout_rate, inplace=False)
 
+        # --- 2. GNN 核心层 (带残差) ---
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        
+        # 辅助函数：生成由边特征控制的权重矩阵
+        # Input: efeature_dim (G, B) -> Output: hidden * hidden
+        def create_edge_net(in_c, out_c):
+            return nn.Sequential(
+                nn.Linear(efeature_dim, hidden_dim), 
+                nn.GELU(),
+                nn.Linear(hidden_dim, in_c * out_c)
+            )
+
+        # 堆叠 N 层
+        for _ in range(n_gnn_layers):
+            self.convs.append(
+                NNConv(hidden_dim, hidden_dim, 
+                       create_edge_net(hidden_dim, hidden_dim), 
+                       aggr='add')
+            )
+            self.norms.append(nn.LayerNorm(hidden_dim))
+
+        # --- 3. 输出解码层 ---
+        self.output_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+        self.dropout = nn.Dropout(self.dropout_rate)
+
+    # 图处理辅助函数 (保持不变)
     def is_directed(self, edge_index):
         if edge_index.shape[1] == 0: return False
         return edge_index[0,0] not in edge_index[1,edge_index[0,:] == edge_index[1,0]]
     
     def undirect_graph(self, edge_index, edge_attr):
         if self.is_directed(edge_index):
-            edge_index_dup = torch.stack([edge_index[1,:], edge_index[0,:]], dim = 0)
-            edge_index = torch.cat([edge_index, edge_index_dup], dim = 1)
-            edge_attr = torch.cat([edge_attr, edge_attr], dim = 0)
-            return edge_index, edge_attr
-        else:
-            return edge_index, edge_attr
+            edge_index_dup = torch.stack([edge_index[1,:], edge_index[0,:]], dim=0)
+            edge_index = torch.cat([edge_index, edge_index_dup], dim=1)
+            edge_attr = torch.cat([edge_attr, edge_attr], dim=0)
+        return edge_index, edge_attr
     
     def forward(self, data):
-        assert data.x.shape[-1] == 4
-        
         x = data.x 
         mask = data.pred_mask.float()
         edge_index = data.edge_index
         edge_features = data.edge_attr
         
-        # 1. 掩码嵌入
-        x = self.mask_embd(mask) + x
+        # 1. 预处理：映射到 Hidden Space
+        # 融合 Input 和 Mask 信息
+        h = self.input_encoder(x) + self.mask_embd(mask)
         
-        # 2. 处理无向图
+        # 处理无向图
         edge_index, edge_features = self.undirect_graph(edge_index, edge_features)
 
-        # 3. GATv2 循环 (带残差)
-        for i in range(len(self.layers)-1):
-            identity = x
+        # 2. GNN 循环 (Residual Block)
+        for i, conv in enumerate(self.convs):
+            identity = h  # 保存输入用于残差
             
-            # GATv2Conv 接收 edge_attr
-            out = self.layers[i](x, edge_index, edge_attr=edge_features)
+            # Conv
+            h = conv(h, edge_index, edge_features)
             
-            out = self.norms[i](out)
-            out = self.dropout(out)
-            out = nn.ReLU()(out)
+            # Post-processing
+            h = self.norms[i](h)
+            h = F.gelu(h)
+            h = self.dropout(h)
             
-            # 残差连接
-            if out.shape == identity.shape:
-                x = identity + out 
-            else:
-                x = out
+            # 【关键】残差连接
+            h = h + identity
         
-        # 4. 最后一层
-        x = self.layers[-1](x, edge_index, edge_attr=edge_features)
-        
-        return x
+        # 3. 输出解码
+        out = self.output_decoder(h)
+
+        return out
     
 class MaskEmbdMultiMPN_NNConv_v2(nn.Module):
     """
@@ -1161,437 +1155,278 @@ class MaskEmbdMultiMPN_NNConv_v2(nn.Module):
         x = self.layers[-1](x, edge_index, edge_features)
         
         return x
-        
-# 引入注意力机制的最终融合算法
-# --- 1. 自定义物理注意力层 (保持不变) ---
-class PhysicsAttentionLayer(MessagePassing):
-    def __init__(self, in_channels, out_channels, edge_dim, aggr='add'):
-        super().__init__(aggr=aggr)
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.edge_dim = edge_dim
-        
-        # 物理权重生成 (NNConv Logic)
-        self.edge_net = nn.Sequential(
-            nn.Linear(edge_dim, 64), # 保持 64 宽瓶颈
-            nn.ReLU(),
-            nn.Linear(64, in_channels * out_channels)
-        )
-        
-        # 注意力网络 (Attention Mechanism)
-        # Input: x_i + x_j + edge_attr
-        self.att_net = nn.Sequential(
-            nn.Linear(in_channels * 2 + edge_dim, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, 1)
-        )
 
-    def forward(self, x, edge_index, edge_attr):
-        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
 
-    def message(self, x_i, x_j, edge_attr, index):
-        # A. 物理权重 (Physics Weight)
-        weight = self.edge_net(edge_attr)
-        weight = weight.view(-1, self.in_channels, self.out_channels)
-        phys_msg = torch.matmul(x_j.unsqueeze(1), weight).squeeze(1)
-        
-        # B. 注意力系数 (Attention Score)
-        cat_features = torch.cat([x_i, x_j, edge_attr], dim=-1)
-        alpha = self.att_net(cat_features)
-        alpha = softmax(alpha, index)
-        
-        # C. 融合
-        return phys_msg * alpha
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import NNConv, LayerNorm
+from torch_geometric.utils import to_dense_batch
 
-# --- 2. 主模型 (移除 _reset_parameters) ---
-class MaskEmbdMultiMPN_PhysicsAttn(nn.Module):
+class MaskEmbdMultiMPN_Transformer_Large(nn.Module):
     """
-    Architecture:
-    - Custom Physics Attention Layer
-    - K-Hop Accumulation
-    - Residual Connections
-    - Standard Initialization (Non-Zero) <--- 符合你的要求
+    [Heavy-Duty GNN + Transformer Hybrid]
+    
+    Structure (Sandwich):
+    1. Embedding
+    2. Pre-GNN (Local Physics extraction)
+    3. Deep Transformer (Global Sync & Reference propagation)
+    4. Post-GNN (Physics Refinement based on global context)
+    5. Decoder
     """
-    def __init__(self, nfeature_dim, efeature_dim, output_dim, hidden_dim, n_gnn_layers, K, dropout_rate):
+    def __init__(self, nfeature_dim, efeature_dim, output_dim, hidden_dim, 
+                 n_gnn_layers, K ,transformer_layers=4, dropout_rate=0.0):
         super().__init__()
-        self.nfeature_dim = nfeature_dim
         self.hidden_dim = hidden_dim
-        self.K = K
         self.dropout_rate = dropout_rate
         
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        
-        # 1. 第一层
-        self.layers.append(PhysicsAttentionLayer(nfeature_dim, hidden_dim, efeature_dim))
-        self.norms.append(nn.LayerNorm(hidden_dim))
-        
-        # 2. 中间层
-        for _ in range(n_gnn_layers - 2):
-            self.layers.append(PhysicsAttentionLayer(hidden_dim, hidden_dim, efeature_dim))
-            self.norms.append(nn.LayerNorm(hidden_dim))
-            
-        # 3. 最后一层
-        self.layers.append(PhysicsAttentionLayer(hidden_dim, output_dim, efeature_dim))
-        
-        # Mask Embedding
+        # 1. Input Projection
+        self.input_encoder = nn.Linear(nfeature_dim, hidden_dim)
         self.mask_embd = nn.Sequential(
             nn.Linear(nfeature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, nfeature_dim)
-        )
-        self.dropout = nn.Dropout(dropout_rate)
-        
-        # === [已删除] _reset_parameters ===
-        # 现在使用的是 PyTorch 默认的随机初始化 (Kaiming/Xavier)
-        # 这符合你 "先大后小学习率 + 非零初始化" 的策略
-
-    def is_directed(self, edge_index):
-        if edge_index.shape[1] == 0: return False
-        return edge_index[0,0] not in edge_index[1,edge_index[0,:] == edge_index[1,0]]
-    
-    def undirect_graph(self, edge_index, edge_attr):
-        if self.is_directed(edge_index):
-            edge_index_dup = torch.stack([edge_index[1,:], edge_index[0,:]], dim = 0)
-            edge_index = torch.cat([edge_index, edge_index_dup], dim = 1)
-            edge_attr = torch.cat([edge_attr, edge_attr], dim = 0)
-            return edge_index, edge_attr
-        else:
-            return edge_index, edge_attr
-
-    def forward(self, data):
-        assert data.x.shape[-1] == 4
-        x, mask = data.x, data.pred_mask.float()
-        edge_index, edge_attr = data.edge_index, data.edge_attr
-        
-        x = self.mask_embd(mask) + x
-        edge_index, edge_attr = self.undirect_graph(edge_index, edge_attr)
-
-        for i in range(len(self.layers)-1):
-            identity = x
-            
-            # --- K-Hop 累加 ---
-            if x.shape[-1] == self.hidden_dim:
-                hop_accum = x
-                curr = x
-                for k in range(self.K):
-                    curr = self.layers[i](curr, edge_index, edge_attr)
-                    curr = torch.relu(curr)
-                    hop_accum = hop_accum + curr
-                out = hop_accum
-            else:
-                out = self.layers[i](x, edge_index, edge_attr)
-            
-            out = self.norms[i](out)
-            out = self.dropout(out)
-            out = nn.ReLU()(out)
-            
-            if out.shape == identity.shape:
-                x = identity + out
-            else:
-                x = out
-                
-        x = self.layers[-1](x, edge_index, edge_attr)
-        return x
-
-# 这是在NNConv基础上加了注意力机制的实现
-class AttentiveNNConv(NNConv):
-    """
-    [继承自 NNConv 的注意力版算子]
-    
-    它保留了 NNConv 的所有物理特性 (edge_net)，
-    但增加了一个注意力网络 (att_net) 来动态调整每条边的权重。
-    
-    公式变更为: 
-    x_i' = Sum( Attention(x_i, x_j, e_ij) * (x_j @ Weight(e_ij)) )
-    """
-    def __init__(self, in_channels, out_channels, nn, aggr='add', root_weight=True, bias=True, **kwargs):
-        # 1. 初始化父类 NNConv (它会帮我们管理 edge_net)
-        super().__init__(in_channels, out_channels, nn, aggr=aggr, root_weight=root_weight, bias=bias, **kwargs)
-        
-        # 2. 新增：注意力网络
-        # 输入: x_i (in) + x_j (in) + edge_attr (2)
-        # 我们需要知道 edge_dim 是多少，这里假设 edge_net 的输入层就是 edge_dim
-        # self.nn[0] 是 edge_net 的第一层 Linear
-        edge_dim = self.nn[0].in_features 
-        
-        self.att_net = nn.Sequential(
-            nn.Linear(in_channels * 2 + edge_dim, 64),
-            nn.LeakyReLU(0.2),
-            nn.Linear(64, 1)
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
         )
 
-    def message(self, x_i, x_j, edge_attr, index):
-        # --- Part A: 物理流 (完全复用 NNConv 的逻辑) ---
-        # 1. 让父类 NNConv 的 edge_net 计算物理权重矩阵
-        weight = self.nn(edge_attr)
-        weight = weight.view(-1, self.in_channels, self.out_channels)
-        
-        # 2. 执行物理变换 (x_j * W)
-        # 这是 NNConv 的标准操作
-        phys_msg = torch.matmul(x_j.unsqueeze(1), weight).squeeze(1)
-        
-        # --- Part B: 注意力流 (新增) ---
-        # 计算注意力分数
-        cat_features = torch.cat([x_i, x_j, edge_attr], dim=-1)
-        alpha = self.att_net(cat_features)
-        alpha = softmax(alpha, index) # 归一化
-        
-        # --- Part C: 融合 ---
-        # 物理消息 * 注意力系数
-        return phys_msg * alpha
-
-
-class MaskEmbdMultiMPN_NNConv_Attn(nn.Module):
-    """
-    [Based on NNConv_v2]
-    
-    Retains:
-    1. K-Hop Accumulation (Global Receptive Field)
-    2. Residual Connections (Deep Network)
-    3. Standard Initialization (Fast Learning)
-    
-    Adds:
-    - AttentiveNNConv: Replaces standard NNConv with the attention-enhanced version.
-    """
-    def __init__(self, nfeature_dim, efeature_dim, output_dim, hidden_dim, n_gnn_layers, K, dropout_rate):
-        super().__init__()
-        self.nfeature_dim = nfeature_dim
-        self.efeature_dim = efeature_dim
-        self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
-        self.n_gnn_layers = n_gnn_layers
-        self.dropout_rate = dropout_rate
-        self.K = K 
-        
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-
-        # --- 辅助函数：生成边映射网络 (Edge Network) ---
-        # 保持 64 宽度的瓶颈设计
+        # 辅助函数：生成边权重
         def create_edge_net(in_c, out_c):
             return nn.Sequential(
-                nn.Linear(efeature_dim, 64), 
-                nn.ReLU(),
-                nn.Linear(64, in_c * out_c)
+                nn.Linear(efeature_dim, hidden_dim), 
+                nn.GELU(),
+                nn.Linear(hidden_dim, in_c * out_c)
             )
 
-        # 1. 第一层 (使用 AttentiveNNConv)
-        # nn 参数传入 create_edge_net 生成的网络
-        self.layers.append(AttentiveNNConv(nfeature_dim, hidden_dim, 
-                                           nn=create_edge_net(nfeature_dim, hidden_dim), 
-                                           aggr='add'))
-        self.norms.append(nn.LayerNorm(hidden_dim))
-
-        # 2. 中间层
-        for l in range(n_gnn_layers - 2):
-            self.layers.append(AttentiveNNConv(hidden_dim, hidden_dim, 
-                                               nn=create_edge_net(hidden_dim, hidden_dim), 
-                                               aggr='add'))
-            self.norms.append(nn.LayerNorm(hidden_dim))
-            
-        # 3. 最后一层
-        self.layers.append(AttentiveNNConv(hidden_dim, output_dim, 
-                                           nn=create_edge_net(hidden_dim, output_dim), 
-                                           aggr='add'))
-        
-        # 4. 掩码嵌入
-        self.mask_embd = nn.Sequential(
-            nn.Linear(nfeature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, nfeature_dim)
-        )
-        self.dropout = nn.Dropout(self.dropout_rate, inplace=False)
-
-    # ... (is_directed 和 undirect_graph 保持不变) ...
-    def is_directed(self, edge_index):
-        if edge_index.shape[1] == 0: return False
-        return edge_index[0,0] not in edge_index[1,edge_index[0,:] == edge_index[1,0]]
-    
-    def undirect_graph(self, edge_index, edge_attr):
-        if self.is_directed(edge_index):
-            edge_index_dup = torch.stack([edge_index[1,:], edge_index[0,:]], dim = 0)
-            edge_index = torch.cat([edge_index, edge_index_dup], dim = 1)
-            edge_attr = torch.cat([edge_attr, edge_attr], dim = 0)
-            return edge_index, edge_attr
-        else:
-            return edge_index, edge_attr
-
-    def forward(self, data):
-        assert data.x.shape[-1] == 4
-        
-        x = data.x 
-        mask = data.pred_mask.float()
-        edge_index = data.edge_index
-        edge_features = data.edge_attr
-        
-        x = self.mask_embd(mask) + x
-        edge_index, edge_features = self.undirect_graph(edge_index, edge_features)
-
-        # --- 循环逻辑 (保持 NNConv_v2 的 K-hop 累加) ---
-        for i in range(len(self.layers)-1):
-            identity = x 
-            
-            if x.shape[-1] == self.hidden_dim:
-                hop_accum = x 
-                current_signal = x
-                
-                # K-Hop 循环
-                for k in range(self.K):
-                    # 调用 AttentiveNNConv
-                    current_signal = self.layers[i](current_signal, edge_index, edge_features)
-                    current_signal = torch.relu(current_signal)
-                    hop_accum = hop_accum + current_signal
-                
-                out = hop_accum
-            else:
-                out = self.layers[i](x, edge_index, edge_features)
-
-            out = self.norms[i](out)
-            out = self.dropout(out)
-            out = nn.ReLU()(out)
-            
-            if out.shape == identity.shape:
-                x = identity + out 
-            else:
-                x = out
-        
-        x = self.layers[-1](x, edge_index, edge_features)
-        return x
-    
-# 最新的TAGNNConv
-class TAGNNConvBlock(nn.Module):
-    """
-    [TAGCN 风格的 NNConv 模块]
-    
-    原理: H = Sum_{k=0}^K ( Diffusion^k(X) @ Theta_k )
-    
-    1. 使用 NNConv 作为 "Diffusion Operator" (扩散算子)。
-    2. 对每一跳 (0到K) 的结果，使用独立的 Linear 层 (Theta_k) 进行特征提取。
-    3. 最后将不同跳的信息相加。
-    
-    优点: 解决了过平滑问题，模型可以自适应地决定需要多大范围的信息。
-    """
-    def __init__(self, in_channels, out_channels, edge_dim, K=3):
-        super().__init__()
-        self.K = K
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        
-        self.edge_net = nn.Sequential(
-            nn.Linear(edge_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, in_channels * in_channels) # 保持维度不变以便多次扩散
-        )
-        self.diff_conv = NNConv(in_channels, in_channels, self.edge_net, 
-                                aggr='add', root_weight=False, bias=False)
-        
-        self.lin_hops = nn.ModuleList([
-            nn.Linear(in_channels, out_channels) for _ in range(K + 1)
-        ])
-
-    def forward(self, x, edge_index, edge_attr):
-        # --- Step 0: 0-hop (自身特征) ---
-        # 相当于公式里的 X @ Theta_0
-        out = self.lin_hops[0](x)
-        
-        current_x = x
-        
-        # --- Step 1...K: 扩散与聚合 ---
-        for k in range(self.K):
-            # 1. 纯扩散 (Diffusion) - 不加 ReLU，不改变维度
-            # 这一步模拟物理信号在网络中多传了一步
-            current_x = self.diff_conv(current_x, edge_index, edge_attr)
-            
-            # 2. 投影并累加 (Projection & Accumulation)
-            # 相当于公式里的 (A^k X) @ Theta_k
-            # 模型会自动学习 self.lin_hops[k+1] 的参数
-            # 如果这一跳的信息导致过平滑，模型会把这个 Linear 的权重学成 0
-            weighted_hop = self.lin_hops[k+1](current_x)
-            
-            out = out + weighted_hop
-
-        # 最后统一做一次非线性激活
-        return out
-    
-class MaskEmbdMultiMPN_TAG_NNConv(nn.Module):
-    def __init__(self, nfeature_dim, efeature_dim, output_dim, hidden_dim, n_gnn_layers, K, dropout_rate):
-        super().__init__()
-        self.nfeature_dim = nfeature_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.K = K 
-        self.dropout_rate = dropout_rate
-        
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        
-        # 1. 输入层嵌入 (先把维度统一到 hidden_dim)
-        self.input_proj = nn.Linear(nfeature_dim, hidden_dim)
-
-        # 2. 中间层 (堆叠多个 TAG Block)
-        # 注意：这里的 n_gnn_layers 现在代表你要做几次 "TAG 融合"
-        for l in range(n_gnn_layers):
-            self.layers.append(
-                TAGNNConvBlock(in_channels=hidden_dim, 
-                               out_channels=hidden_dim, # 中间层保持 hidden
-                               edge_dim=efeature_dim, 
-                               K=K)
+        # 2. Pre-GNN Layers (前置 GNN，负责提取初步物理特征)
+        self.pre_convs = nn.ModuleList()
+        self.pre_norms = nn.ModuleList()
+        for _ in range(n_gnn_layers):
+            self.pre_convs.append(
+                NNConv(hidden_dim, hidden_dim, create_edge_net(hidden_dim, hidden_dim), aggr='add')
             )
-            self.norms.append(nn.LayerNorm(hidden_dim))
-            
-        # 3. 输出头
-        self.output_head = nn.Linear(hidden_dim, output_dim)
-        
-        # 4. 掩码嵌入 (保持你原有的逻辑)
-        self.mask_embd = nn.Sequential(
-            nn.Linear(nfeature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, nfeature_dim)
+            self.pre_norms.append(nn.LayerNorm(hidden_dim))
+
+        # 3. Deep Transformer (加深！负责全局对齐)
+        # 这里把 num_layers 提出来作为参数
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=8,            # 头数增加到 8，捕捉更细微的关系
+            dim_feedforward=hidden_dim * 4, 
+            dropout=dropout_rate,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True     # Pre-Norm 结构，训练深层网络更稳定
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
+        
+        # 4. Post-GNN Layers (后置 GNN，负责利用全局信息精修物理)
+        # 通常 2 层就够了
+        self.post_convs = nn.ModuleList()
+        self.post_norms = nn.ModuleList()
+        for _ in range(2): 
+            self.post_convs.append(
+                NNConv(hidden_dim, hidden_dim, create_edge_net(hidden_dim, hidden_dim), aggr='add')
+            )
+            self.post_norms.append(nn.LayerNorm(hidden_dim))
+
+        # 5. Output Decoder
+        self.output_decoder = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
         self.dropout = nn.Dropout(self.dropout_rate)
 
-    # ... (保持 is_directed 和 undirect_graph 函数不变) ...
+    # ... (保持 is_directed 和 undirect_graph 不变) ...
     def is_directed(self, edge_index):
         if edge_index.shape[1] == 0: return False
         return edge_index[0,0] not in edge_index[1,edge_index[0,:] == edge_index[1,0]]
     
     def undirect_graph(self, edge_index, edge_attr):
         if self.is_directed(edge_index):
-            edge_index_dup = torch.stack([edge_index[1,:], edge_index[0,:]], dim = 0)
-            edge_index = torch.cat([edge_index, edge_index_dup], dim = 1)
-            edge_attr = torch.cat([edge_attr, edge_attr], dim = 0)
-            return edge_index, edge_attr
-        else:
-            return edge_index, edge_attr
+            edge_index_dup = torch.stack([edge_index[1,:], edge_index[0,:]], dim=0)
+            edge_index = torch.cat([edge_index, edge_index_dup], dim=1)
+            edge_attr = torch.cat([edge_attr, edge_attr], dim=0)
+        return edge_index, edge_attr
 
     def forward(self, data):
         x = data.x 
         mask = data.pred_mask.float()
         edge_index = data.edge_index
         edge_features = data.edge_attr
+        batch = data.batch
         
-        # 预处理
-        x = self.mask_embd(mask) + x
+        # --- A. Embedding ---
+        h = self.input_encoder(x) + self.mask_embd(mask)
         edge_index, edge_features = self.undirect_graph(edge_index, edge_features)
+
+        # --- B. Pre-GNN (Local Physics) ---
+        for i, conv in enumerate(self.pre_convs):
+            identity = h
+            h = conv(h, edge_index, edge_features)
+            h = self.pre_norms[i](h)
+            h = F.gelu(h)
+            h = self.dropout(h)
+            h = h + identity # ResNet
+
+        # --- C. Deep Global Transformer ---
+        # 1. To Dense
+        h_dense, mask_batch = to_dense_batch(h, batch)
         
-        # 先映射到 hidden 空间，方便后面统一处理
-        x = self.input_proj(x)
+        # 2. Attention (Mask logic: True means ignore)
+        h_global = self.transformer(h_dense, src_key_padding_mask=(~mask_batch))
         
-        # 主循环
-        for i in range(len(self.layers)):
-            identity = x
-            
-            # 调用 TAG Block
-            out = self.layers[i](x, edge_index, edge_features)
-            
-            out = self.norms[i](out)
-            out = self.dropout(out)
-            out = F.relu(out) # Block 出来后再激活
-            
-            # 残差连接
-            x = identity + out 
-            
-        # 输出
-        x = self.output_head(x)
-        return x
+        # 3. To Sparse
+        h_global_flat = h_global[mask_batch]
+        
+        # 4. Residual Connection (Global info added to Local features)
+        h = h + h_global_flat
+
+        # --- D. Post-GNN (Physics Refinement) ---
+        # 拿着全局信息再次进行物理校验
+        for i, conv in enumerate(self.post_convs):
+            identity = h
+            h = conv(h, edge_index, edge_features)
+            h = self.post_norms[i](h)
+            h = F.gelu(h)
+            h = self.dropout(h)
+            h = h + identity
+
+        # --- E. Output ---
+        out = self.output_decoder(h)
+
+        return out
+
+class MaskEmbdMultiMPN_Transformer(nn.Module):
+    """
+    [GNN + Transformer Hybrid Architecture]
+    
+    Philosophy:
+    1. GNN (NNConv): Handles local physical constraints (Kirchhoff's Laws).
+    2. Transformer: Handles global dependencies (Reference Angle Propagation & Global Power Balance).
+    
+    Structure:
+    Input -> Embedding -> [NNConv ResBlocks] -> [Global Transformer] -> Decoder -> Output
+    """
+    def __init__(self, nfeature_dim, efeature_dim, output_dim, hidden_dim, n_gnn_layers, K, dropout_rate):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.dropout_rate = dropout_rate
+        
+        # 1. Input Projection
+        self.input_encoder = nn.Linear(nfeature_dim, hidden_dim)
+        self.mask_embd = nn.Sequential(
+            nn.Linear(nfeature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # 2. Local Physics Processor (GNN Layers)
+        # 我们依然保留 NNConv 来处理局部物理，但层数可以不用那么多
+        # self.convs 是GNN的部分，里面塞了n_gnn_layers个NNConv
+        self.convs = nn.ModuleList()
+
+        # 这个里面是一个归一化层
+        self.norms = nn.ModuleList()
+        
+        def create_edge_net(in_c, out_c):
+            return nn.Sequential(
+                nn.Linear(efeature_dim, hidden_dim), 
+                nn.GELU(),
+                nn.Linear(hidden_dim, in_c * out_c)
+            )
+
+        for _ in range(n_gnn_layers):
+            self.convs.append(
+                NNConv(hidden_dim, hidden_dim, 
+                       create_edge_net(hidden_dim, hidden_dim), 
+                       aggr='add')
+            )
+            self.norms.append(nn.LayerNorm(hidden_dim))
+
+        # 3. Global Information Processor (Transformer)
+        # 这是一个标准的 Transformer Encoder 层
+        # batch_first=True: 输入格式为 [Batch, Seq_Len, Dim]
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=4,            # 4头注意力
+            dim_feedforward=hidden_dim * 2, 
+            dropout=dropout_rate,
+            activation='gelu',
+            batch_first=True 
+        )
+
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1) # 1层通常足够，也可以设为2
+        
+        # 4. Transformer 后的归一化
+        self.global_norm = nn.LayerNorm(hidden_dim)
+
+        # 5. Output Decoder，这是一个MLP的预测头
+        self.output_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+        self.dropout = nn.Dropout(self.dropout_rate)
+
+    def is_directed(self, edge_index):
+        if edge_index.shape[1] == 0: return False
+        return edge_index[0,0] not in edge_index[1,edge_index[0,:] == edge_index[1,0]]
+    
+    def undirect_graph(self, edge_index, edge_attr):
+        if self.is_directed(edge_index):
+            edge_index_dup = torch.stack([edge_index[1,:], edge_index[0,:]], dim=0)
+            edge_index = torch.cat([edge_index, edge_index_dup], dim=1)
+            edge_attr = torch.cat([edge_attr, edge_attr], dim=0)
+        return edge_index, edge_attr
+    
+    def forward(self, data):
+        # 读取数据
+        x = data.x
+        # 读取mask数据
+        mask = data.pred_mask.float()
+        # 读取边的信息
+        edge_index = data.edge_index
+        edge_features = data.edge_attr
+        batch = data.batch # 获取 batch 索引 [0, 0, ..., 1, 1, ...]
+        
+        # --- A. Embedding ---，用全连接层，对输入和掩码进行内容的丰富
+        h = self.input_encoder(x) + self.mask_embd(mask)
+        edge_index, edge_features = self.undirect_graph(edge_index, edge_features)
+
+        # --- B. Local GNN Propagation (NNConv ResNet) ---
+        for i, conv in enumerate(self.convs):
+            identity = h
+            h = conv(h, edge_index, edge_features)
+            h = self.norms[i](h)
+            h = F.gelu(h)
+            h = self.dropout(h)
+            h = h + identity # Residual
+
+        # --- C. Global Transformer Attention ---
+        # 1. 转换为 Dense Batch: [Batch_Size, Max_Nodes, Hidden_Dim]
+        # to_dense_batch 会自动填充 padding (mask_batch 用于指示哪些是填充点)
+        h_dense, mask_batch = to_dense_batch(h, batch)
+        
+        # 2. Transformer 全局交互
+        # src_key_padding_mask: 告诉 Transformer 忽略填充点
+        # 注意: PyTorch Transformer 的 mask 逻辑是 True 代表忽略(masked)
+        # mask_batch 里 True 代表有效节点，False 代表填充
+        # 所以传入 Transformer 时要取反 (~mask_batch)
+        h_global = self.transformer(h_dense, src_key_padding_mask=(~mask_batch))
+        
+        # 3. 还原为 Sparse Batch (Flatten)
+        # 只取有效节点的数据
+        h_global_flat = h_global[mask_batch]
+        
+        # 4. 残差连接：融合局部信息和全局信息
+        h = h + h_global_flat
+        h = self.global_norm(h)
+
+        # --- D. Output ---
+        out = self.output_decoder(h)
+
+        return out
+    

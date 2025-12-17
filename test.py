@@ -5,11 +5,11 @@ import torch_geometric
 from functools import partial
 
 # 引入你的数据和模型定义
-from datasets.PowerFlowData import PowerFlowData, denormalize
+from datasets.PowerFlowData_copy import PowerFlowData, denormalize
 from networks.MPN import (
     MPN, MPN_simplenet, SkipMPN, MaskEmbdMPN, MultiConvNet, MultiMPN, 
     MaskEmbdMultiMPN, MaskEmbdMultiMPN_NNConv, MaskEmbdMultiMPN_NNConv_v2, 
-    MaskEmbdMultiMPN_PhysicsAttn, MaskEmbdMultiMPN_TAG_NNConv
+    MaskEmbdMultiMPN_PhysicsAttn, MaskEmbdMultiMPN_TAG_NNConv,ImprovedPowerFlowGNN
 )
 from utils.evaluation import load_model, evaluate_epoch_v2
 from utils.argument_parser import argument_parser
@@ -76,7 +76,7 @@ def compute_mape_metrics(model, loader, xymean, xystd, device, eps=1e-2):
 def main():
     # ================= [配置区域] =================
     # 请在这里填入你想要测试的 Run ID
-    run_id = '20251208-5576add' 
+    run_id = '20251211-9602' 
     # ============================================
 
     args = argument_parser()
@@ -93,7 +93,8 @@ def main():
         'MaskEmbdMultiMPN_NNConv': MaskEmbdMultiMPN_NNConv,
         'MaskEmbdMultiMPN_NNConv_v2': MaskEmbdMultiMPN_NNConv_v2, # 你的新模型
         'MaskEmbdMultiMPN_PhysicsAttn': MaskEmbdMultiMPN_PhysicsAttn,
-        'MaskEmbdMultiMPN_TAG_NNConv': MaskEmbdMultiMPN_TAG_NNConv
+        'MaskEmbdMultiMPN_TAG_NNConv': MaskEmbdMultiMPN_TAG_NNConv,
+        'ImprovedPowerFlowGNN':ImprovedPowerFlowGNN
     }
 
     batch_size = args.batch_size
