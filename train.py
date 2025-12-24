@@ -5,11 +5,12 @@ import random
 import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
+import shutil # [新增] 用于复制文件备份模型
 
 from tqdm import tqdm
 
 from datasets.PowerFlowData import PowerFlowData, random_bus_type
-from networks.MPN import MPN, MPN_simplenet, SkipMPN, MaskEmbdMPN, MultiConvNet, MultiMPN, MaskEmbdMultiMPN , MaskEmbdMultiMPN_NNConv ,MaskEmbdMultiMPN_NNConv_v2,MaskEmbdMultiMPN_NNConv_v3,MaskEmbdMultiMPN_Transformer,MaskEmbdMultiMPN_Transformer_Large
+from networks.MPN import MPN, MPN_simplenet, SkipMPN, MaskEmbdMPN, MultiConvNet, MultiMPN, MaskEmbdMultiMPN , MaskEmbdMultiMPN_NNConv ,MaskEmbdMultiMPN_NNConv_v2,MaskEmbdMultiMPN_NNConv_v3,MaskEmbdMultiMPN_Transformer,MaskEmbdMultiMPN_GPS
 from utils.argument_parser import argument_parser
 from utils.training import train_epoch, append_to_json
 from utils.evaluation import evaluate_epoch
@@ -40,8 +41,7 @@ def main():
         'MaskEmbdMultiMPN_NNConv_v3':MaskEmbdMultiMPN_NNConv_v3,
         'MaskEmbdMultiMPN_NNConv_v2':MaskEmbdMultiMPN_NNConv_v2,
         'MaskEmbdMultiMPN_Transformer':MaskEmbdMultiMPN_Transformer,
-        'MaskEmbdMultiMPN_Transformer_Large':MaskEmbdMultiMPN_Transformer_Large,
-        'MaskEmbdMultiMPN_Transformer_Interleaved':MaskEmbdMultiMPN_Transformer_Interleaved
+        'MaskEmbdMultiMPN_GPS':MaskEmbdMultiMPN_GPS
     }
     mixed_cases = ['118v2', '14v2']
 
@@ -83,8 +83,7 @@ def main():
     # torch.backends.cudnn.benchmark = False
 
     # Step 1: Load data 加载数据，分别为训练集，验证集，测试集
-    trainset = PowerFlowData(root=data_dir, case=grid_case, split=[.5, .2, .3], task='train', normalize=nomalize_data,
-                             transform=random_bus_type) # 其中这个random_bus_type的意思是数据增强，对母线的结构进行相应的修改，该功能仅在训练时使用
+    trainset = PowerFlowData(root=data_dir, case=grid_case, split=[.5, .2, .3], task='train', normalize=nomalize_data,) # 其中这个random_bus_type的意思是数据增强，对母线的结构进行相应的修改，该功能仅在训练时使用
     valset = PowerFlowData(root=data_dir, case=grid_case, split=[.5, .2, .3], task='val', normalize=nomalize_data)
     testset = PowerFlowData(root=data_dir, case=grid_case, split=[.5, .2, .3], task='test', normalize=nomalize_data)
     
@@ -145,7 +144,7 @@ def main():
     # Step 2: Create model and optimizer (and scheduler)
     node_in_dim, node_out_dim, edge_dim = trainset.get_data_dimensions()    #  获取数据的维度，分别是几点输入维度，节点输出维度，边特征
     # assert node_in_dim == 16
-    assert node_in_dim == 4 # 这里是做一个检查，如果输入的数据的维度不对，就会自动的停止
+    assert node_in_dim == 14 # 这里是做一个检查，如果输入的数据的维度不对，就会自动的停止
     node_out_dim = 2
     # 这里对模型进行初始化
     model = model(
@@ -186,27 +185,52 @@ def main():
             'loss': []},
     }
 
-    WARMUP_EPOCHS = 500
+    WARMUP_EPOCHS = 200
     # pbar = tqdm(range(num_epochs), total=num_epochs, position=0, leave=True)
     for epoch in range(num_epochs):
         # 训练，这里把训练的过程放到了training文件中，这一步只是简单的调用一下训练的函数
         if args.train_loss_fn == 'RectangularMixedLoss':
             if epoch == WARMUP_EPOCHS:
                 print("\n>>> Warm-up 结束，重置 best_val_loss，启动物理约束...")
-                best_val_loss = 1e5
+
+                if os.path.exists(SAVE_MODEL_PATH):
+                    warmup_backup_path = SAVE_MODEL_PATH.replace('.pt', '_warmup.pt')
+                    shutil.copy(SAVE_MODEL_PATH, warmup_backup_path)
+                    print(f"    已备份至: {warmup_backup_path}")
+                
+                print(f">>> 操作 2: 重置 Best Val Loss (防止因 Loss 变大而不保存)")
+                best_val_loss = 1e9 
+                
+                print(f">>> 操作 3: 学习率重置 (可选)")
+                # 如果前100轮LR降太低了，可以手动拉回来一点，给物理微调动力
+                new_lr = 1e-4 
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = new_lr
+
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, 
+                    mode='min', 
+                    factor=0.5, 
+                    patience=10, 
+                    min_lr=1e-6
+                )
 
             if epoch < WARMUP_EPOCHS:
                 # 阶段一：Warm-up (纯数据驱动)
                 loss_fn.alpha = 1.0
                 loss_fn.beta = 0.0
                 loss_fn.gamma = 0.0
+                loss_fn.lambda_anchor=0.1
+                loss_fn.lambda_angle=0
                 phase_name = "WarmUp"
             else:
                 # 阶段二：Physics-Informed (加入物理约束)
                 # alpha 降一点，给物理项留空间
                 loss_fn.alpha = 1.0
-                loss_fn.beta = 1e-5  # 物理不平衡权重 (可调)
-                loss_fn.gamma = 5e-3  # PV电压约束权重 (可调)
+                loss_fn.beta = 1e-3  # 物理不平衡权重 (可调)
+                loss_fn.gamma = 0  # PV电压约束权重 (可调)
+                loss_fn.lambda_anchor = 0.1
+                loss_fn.lambda_angle = 0 # 没啥用
                 phase_name = "Physics"
         else:
             phase_name = "Standard"
@@ -221,9 +245,8 @@ def main():
         train_pv = train_metrics['pv']
         train_mse_e = train_metrics['mse_e']
         train_mse_f = train_metrics['mse_f']
-
-
-
+        train_loss_anchor = train_metrics['loss_anchor']
+        train_loss_angle = train_metrics['loss_angle']
 
         # 验证
         val_metrics = evaluate_epoch(model, val_loader, eval_loss_fn, device)
@@ -233,6 +256,8 @@ def main():
         val_pv = val_metrics['pv']
         val_mse_e = val_metrics['mse_e']
         val_mse_f = val_metrics['mse_f']
+        val_loss_anchor = val_metrics['loss_anchor']
+        val_loss_angle = val_metrics['loss_angle']
         # 调整学习率
         scheduler.step(val_loss)
         # 将训练情况保存到日志中
@@ -250,11 +275,15 @@ def main():
                         'train_mse_f':train_mse_f,
                         'train_phys':train_phys,
                         'train_pv':train_pv,
+                        'train_loss_anchor':train_loss_anchor,
+                        'train_loss_angle':train_loss_angle,
                         'val_loss': val_loss,
                         'val_phys':val_phys,
                         'val_pv':val_pv,
                         'val_mse_e':val_mse_e,
-                        'val_mse_f':val_mse_f
+                        'val_mse_f':val_mse_f,
+                        'val_loss_anchor':val_loss_anchor,
+                        'val_loss_angle':val_loss_angle
                         }
                     )
         # 模型检查点
@@ -312,6 +341,8 @@ def main():
     os.makedirs(os.path.join(LOG_DIR, 'train_log'), exist_ok=True)
     if args.save:
         torch.save(train_log, TRAIN_LOG_PATH)
+
+    
 
 
 if __name__ == '__main__':

@@ -1,9 +1,5 @@
-"""Synthetic Power Flow Data Generator with Pandapower
-Format: 
-    - edge_features: [num_samples, num_edges, 7]
-    - node_features: [num_samples, num_nodes, 6]
-        - index: index of the node, starting from 0
-        - type: 1 for generator, 2 for load
+"""
+生成使用Ybus为信息的数据。这份代码有Yii,1220版本
 """
 import time
 import argparse
@@ -14,10 +10,15 @@ import networkx as nx
 import multiprocessing as mp
 import os
 
+# 导入需要的包
+from pandapower.pd2ppc import _pd2ppc
+from pandapower.pypower.makeYbus import makeYbus
+from scipy.sparse import coo_matrix
+
 from utils.data_utils import perturb_topology
 
 # 生成30000个数据，开10个进程
-number_of_samples = 100
+number_of_samples = 30000
 number_of_processes = 10
 ENFORCE_Q_LIMS = False
 
@@ -38,76 +39,107 @@ def create_case3():
     
     return net
 
-def remove_c_nf(net):
-    net.line['c_nf_per_km'] = pd.Series(0., index=net.line['c_nf_per_km'].index, name=net.line['c_nf_per_km'].name)
+def calculate_net_injection(net):
+    """
+    计算每个节点的净注入功率 (Gen + Ext_Grid - Load)
+    注意：这是为了匹配 Ybus 的计算结果 (流出功率)
+    """
+    n_nodes = len(net.bus)
+    p_inj = np.zeros(n_nodes)
+    q_inj = np.zeros(n_nodes)
     
-def unify_vn(net):
-    for node_id in range(net.bus['vn_kv'].shape[0]):
-        net.bus['vn_kv'][node_id] = max(net.bus['vn_kv'])
-
-def get_trafo_z_pu(net):
-    # for trafo_id in net.trafo.index:
-    #     # net.trafo['i0_percent'][trafo_id] = 0.
-    #     # net.trafo['pfe_kw'][trafo_id] = 0.
-    #     net.trafo[trafo_id, 'i0_percent'] = 0.
-    #     net.trafo[trafo_id, 'pfe_kw'] = 0.
+    # 1. 减去负载 (Load)
+    # Pandapower 中 load['p_mw'] > 0 表示消耗
+    if not net.load.empty:
+        # 这种写法比 iterrows 快很多
+        load_bus = net.load['bus'].values.astype(int)
+        p_load = net.load['p_mw'].values
+        q_load = net.load['q_mvar'].values
+        # 累加 (处理多个负载接在同一个节点的情况)
+        np.add.at(p_inj, load_bus, -p_load)
+        np.add.at(q_inj, load_bus, -q_load)
         
-    net.trafo.loc[net.trafo.index, 'i0_percent'] = 0.
-    net.trafo.loc[net.trafo.index, 'pfe_kw'] = 0.
+    # 2. 加上发电机 (Gen) - 使用 res_gen (计算结果)
+    # 因为 PV 节点的 Q 是算出来的，必须用 res_gen
+    if not net.res_gen.empty:
+        gen_bus = net.gen['bus'].values.astype(int)
+        p_gen = net.res_gen['p_mw'].values
+        q_gen = net.res_gen['q_mvar'].values
+        np.add.at(p_inj, gen_bus, p_gen)
+        np.add.at(q_inj, gen_bus, q_gen)
+        
+    # 3. 加上外部电网 (Ext_Grid) - 使用 res_ext_grid
+    if not net.res_ext_grid.empty:
+        ext_bus = net.ext_grid['bus'].values.astype(int)
+        p_ext = net.res_ext_grid['p_mw'].values
+        q_ext = net.res_ext_grid['q_mvar'].values
+        np.add.at(p_inj, ext_bus, p_ext)
+        np.add.at(q_inj, ext_bus, q_ext)
+        
+    # 4. 转换为标幺值 (p.u.)
+    p_pu = p_inj / net.sn_mva
+    q_pu = q_inj / net.sn_mva
     
-    z_pu = net.trafo['vk_percent'].values / 100. * 1000. / net.sn_mva
-    r_pu = net.trafo['vkr_percent'].values / 100. * 1000. / net.sn_mva
-    x_pu = np.sqrt(z_pu**2 - r_pu**2)
+    return p_pu, q_pu
     
-    return x_pu, r_pu
-    
-def get_line_z_pu(net):
-    r = net.line['r_ohm_per_km'].values * net.line['length_km'].values
-    x = net.line['x_ohm_per_km'].values * net.line['length_km'].values
-    from_bus = net.line['from_bus']
-    to_bus = net.line['to_bus']
-    vn_kv_to = net.bus['vn_kv'][to_bus].to_numpy()
-    # vn_kv_to = pd.Series(vn_kv_to)
-    zn = vn_kv_to**2 / net.sn_mva
-    r_pu = r/zn
-    x_pu = x/zn
-    
-    return r_pu, x_pu
+# 这个函数用于从net中提取相应的Ybus的信息
+def extract_ybus_data(net):
+    '''
+    return:
+    edge_features:[From,To,G_ij,B_ij]
+    node_g 节点自身的导纳实部
+    node_b 节点自身的导纳虚部
+    '''
 
-def get_line_y_pu(net):
-    # 先获取原来的 R 和 X
-    r_pu, x_pu = get_line_z_pu(net)
-    
-    # 计算分母 |Z|^2 = R^2 + X^2
-    # 添加 1e-12 防止除以 0
-    denom = r_pu**2 + x_pu**2 + 1e-12
-    
-    # 计算电导 G 和电纳 B
-    # 公式: Y = 1/(R+jX) = (R-jX)/(R^2+X^2)
-    g_pu = r_pu / denom
-    b_pu = -x_pu / denom  # 注意：电力系统中通常 B 取负值表示感性
-    
-    return g_pu, b_pu
+    # 1. 转换为 PYPOWER 格式 (这是 Pandapower 计算的核心结构)
+    ppc, ppci = _pd2ppc(net)
+    baseMVA, bus, branch = ppc["baseMVA"], ppc["bus"], ppc["branch"]
 
-def get_trafo_y_pu(net):
-    # 先获取变压器的 R 和 X
-    x_pu, r_pu = get_trafo_z_pu(net) # 注意你原代码这里也是调用的这个
+    # 2. 生成 Ybus (稀疏复数矩阵)
+    # makeYbus 会自动处理变压器变比、线路充电电容、并联补偿等所有物理细节
+    Ybus, Yf, Yt = makeYbus(baseMVA, bus, branch)
     
-    denom = x_pu**2 + r_pu**2 + 1e-12
-    
-    g_pu = r_pu / denom
-    b_pu = -x_pu / denom
-    
-    return g_pu, b_pu
+    # print(f"Ybus = {Ybus}") # 这个可以作为相应的检查的点
 
-def get_adjacency_matrix(net):
-    multi_graph = pp.topology.create_nxgraph(net)
-    A = nx.adjacency_matrix(multi_graph).todense() 
+    # 3. 转换为 COO 格式以便提取数据
+    y_coo = Ybus.tocoo()
+    row = y_coo.row
+    col = y_coo.col
+    data = y_coo.data
+
+    # 提取边特征，非对角元素，Yij
+    mask_edge = (row != col)
+
+    src = row[mask_edge]    # 即from
+    dst = col[mask_edge]    # 即to
+    y_edge = data[mask_edge]
+
+    # 用边特征构建edge_feature
+    edge_features = np.zeros((len(src),4))
+    edge_features[:,0] = src
+    edge_features[:,1] = dst
+    edge_features[:,2] = y_edge.real
+    edge_features[:,3] = y_edge.imag
+
+    # 提取节点自身导纳，Yii
+    n_nodes = len(net.bus)
+    y_diag_g = np.zeros(n_nodes)
+    y_diag_b = np.zeros(n_nodes)
+
+    mask_diag = (row==col)
+    diag_nodes = row[mask_diag]
+    diag_vals = data[mask_diag]
+
+    y_diag_g[diag_nodes] = diag_vals.real
+    y_diag_b[diag_nodes] = diag_vals.imag
+
+    # 最后返回边特征（构建好），节点导纳，分开
+    return edge_features , y_diag_g , y_diag_b
     
-    return A
 
 # 这一段是生成数据的代码
 def generate_data(sublist_size, rng, base_net_create, num_lines_to_remove=0, num_lines_to_add=0):
+    # 先准备好空的列表
     edge_features_list = []
     node_features_list = []
     # graph_feature_list = []
@@ -115,158 +147,90 @@ def generate_data(sublist_size, rng, base_net_create, num_lines_to_remove=0, num
     while len(edge_features_list) < sublist_size:
 
         net = base_net_create()
-        remove_c_nf(net)
         
+        # 这一段是有关拓扑扰动的，由于我们的num_lines_to_remove=0, num_lines_to_add=0，所以并无影响
         success_flag, net = perturb_topology(net, num_lines_to_remove=num_lines_to_remove, num_lines_to_add=num_lines_to_add) # TODO 
         if success_flag == 1:
             exit()
+        
         n = net.bus.values.shape[0]
-        A = get_adjacency_matrix(net)
         
         net.bus['name'] = net.bus.index
 
+        # 获取参数
         r = net.line['r_ohm_per_km'].values    
         x = net.line['x_ohm_per_km'].values
-        # c = net.line['c_nf_per_km'].values
-        le = net.line['length_km'].values
-        # x = case['branch'][:, 3]
-        # b = case['branch'][:, 4]
-        # tau = case['branch'][:, 8]  # ratio
+        # 赋值，其中我想暂时保持r和x不变
+        net.line['r_ohm_per_km'] = r 
+        net.line['x_ohm_per_km'] = x
 
+        # 获取参数
         Pg = net.gen['p_mw'].values
-        # Pmin = 
         Pd = net.load['p_mw'].values
         Qd = net.load['q_mvar'].values
-
-        # rng = np.random.default_rng()
-        # r = rng.uniform(0.8*r, 1.2*r, r.shape[0])
-        # _x_min = np.where(x>=0, 0.8*x, 1.2*x) # in 6470rte, line reactance might be negative
-        # _x_max = np.where(x>=0, 1.2*x, 0.8*x)
-        # x = rng.uniform(_x_min, _x_max, x.shape[0])
-        # # c = np.random.uniform(0.8*c, 1.2*c, c.shape[0])
-        # le = rng.uniform(0.8*le, 1.2*le, le.shape[0])
-        
-        # tau = np.random.uniform(0.8*tau, 1.2*tau, case['branch'].shape[0])
-        # angle = np.random.uniform(-0.2, 0.2, case['branch'].shape[0])
-    
+        # 增加扰动，其中电压和节点的参数都在原本的数据的基础上进行一定波动
         Vg = rng.uniform(1.00, 1.05, net.gen['vm_pu'].shape[0])
         Pg = rng.normal(Pg, 0.1*np.abs(Pg), net.gen['p_mw'].shape[0])
-        
-        # Pd = np.random.uniform(0.5*Pd, 1.5*Pd, net.load['p_mw'].shape[0])
         Pd = rng.normal(Pd, 0.1*np.abs(Pd), net.load['p_mw'].shape[0])
-        # Qd = np.random.uniform(0.5*Qd, 1.5*Qd, net.load['q_mvar'].shape[0])
         Qd = rng.normal(Qd, 0.1*np.abs(Qd), net.load['q_mvar'].shape[0])
         
-        net.line['r_ohm_per_km'] = r 
-        net.line['x_ohm_per_km'] = x 
-
+        # 赋值
         net.gen['vm_pu'] = Vg
         net.gen['p_mw'] = Pg
-
         net.load['p_mw'] = Pd
         net.load['q_mvar'] = Qd
 
-        # 1. 移除并联元件 (Shunts)
-        # 彻底删除 shunt 表中的所有行
-        if not net.shunt.empty:
-            net.shunt.drop(net.shunt.index, inplace=True) 
-
-        # 2. 移除线路对地电容 (Line Charging)
-        # 确保所有线路的电容都为 0
-        net.line['c_nf_per_km'] = 0.0
-        
-        # 3. 强制变压器变比为 1:1 (Fix Tap Ratio)
-        # 禁用分接头调整，或者将所有变比设为 1.0 (标幺值)
-        # Pandapower 中 tap_pos=0 且 shift=0 通常对应额定变比
-        if 'tap_pos' in net.trafo.columns:
-            net.trafo['tap_pos'] = 0.0  # 归零
-            # 或者更彻底：net.trafo['tap_step_percent'] = 0.0
-            
-        if 'shift_degree' in net.trafo.columns:
-            net.trafo['shift_degree'] = 0.0
-
-        # 4. 强制 Slack 相角为 0 (这一步你之前已经加了，保留即可)
+        # 强制 Slack 相角为 0 方便模型学习
         if 'va_degree' in net.ext_grid.columns:
             net.ext_grid['va_degree'] = 0.0
 
-        
-
+        # 其他的改变不动，获取原始的net的数据
         try:
             net['converged'] = False
             pp.runpp(net, algorithm='nr', init="results", numba=False, enforce_q_lims=ENFORCE_Q_LIMS)
         except:
             if not net['converged']:
-                # print(f"net['converged'] = {net['converged']}")
-                print(f'Failed to converge, current sample number: {len(edge_features_list)}')
-                import pandapower as pp
-                continue        
+                continue      
+        # 在这一步，潮流已经跑完了，要开始提取特征了，我们使用Ybus进行特征提取
+        edge_features , node_g , node_b = extract_ybus_data(net)
 
-        # Graph feature
-        # baseMVA = x[0]['baseMVA']
+        p_true, q_true = calculate_net_injection(net)
 
-        # --- A. 提取线路 (Line) 特征 ---
-        # get_line_y_pu 保持不变，它算的是 r/x -> g/b
-        line_g, line_b = get_line_y_pu(net)
-        
-        edge_features_line = np.zeros((net.line.shape[0], 4))
-        edge_features_line[:, 0] = net.line['from_bus'].values
-        edge_features_line[:, 1] = net.line['to_bus'].values
-        edge_features_line[:, 2] = line_g
-        edge_features_line[:, 3] = line_b
+        # 构建node_features
+        # [Index,Type,Vm,Va,P,Q,Gii,Bii]
+        # 这一句不理解
+        n = net.bus.values.shape[0]
+        types = np.ones(n)*2 # 默认全部设为2，如果是其他节点类型就更改相应的节点
 
-        # --- B. 提取变压器 (Trafo) 特征 ---
-        # 即使是 Trafo，在 p.u. 下也可以算出等效 G, B
-        trafo_g, trafo_b = get_trafo_y_pu(net)
-        
-        edge_features_trafo = np.zeros((net.trafo.shape[0], 4))
-        edge_features_trafo[:, 0] = net.trafo['hv_bus'].values
-        edge_features_trafo[:, 1] = net.trafo['lv_bus'].values
-        edge_features_trafo[:, 2] = trafo_g
-        edge_features_trafo[:, 3] = trafo_b
-        
-        edge_features = np.concatenate((edge_features_line, edge_features_trafo), axis=0)
-
-        # Record node features
-        #   bus type: 0 - slack bus, 1 - generator, 2 - load
-        types = np.ones(n)*2 # type = load
+        # 确定节点类型，这一步不理解
         for j in range(net.gen.shape[0]):    
-            # find index of case['gen'][j,0] in case['bus'][:,0]
             index = np.where(net.gen['bus'].values[j] == net.bus['name'])[0][0] 
-            if ENFORCE_Q_LIMS:
-                if net.res_gen['q_mvar'][j] <= net.gen['min_q_mvar'][j] + 1e-6 \
-                    or net.res_gen['q_mvar'][j] >= net.gen['max_q_mvar'][j] - 1e-6:
-                        continue # seen as load bus
-            types[index] = 1  # type = generator
+            types[index] = 1 
         for j in range(net.ext_grid.shape[0]):
             index = np.where(net.ext_grid['bus'].values[j] == net.bus['name'])[0][0]
-            types[index] = 0 # type = slack bus
-        for j in range(net.load.shape[0]):    
-            index = np.where(net.load['bus'].values[j] == net.bus['name'])[0][0]
-            pass
-        
-        #   Create a vector of node features including index, type, Vm, Va, Pd, Qd, Gs, Bs    
-        node_features = np.zeros((n, 6))
-        node_features[:, 0] = net.bus['name'].values # index
-        node_features[:, 1] = types  # type
-        # Vm ----This changes for Load Buses
-        # if net.res_bus['vm_pu'].shape[0] == 0:
-        #     pass
-        node_features[:, 2] = net.res_bus['vm_pu']  # Vm
-        # Va ----This changes for every bus excecpt slack bus
-        node_features[:, 3] = net.res_bus['va_degree']  # Va
-        node_features[:, 4] = net.res_bus['p_mw'] / net.sn_mva    # P / pu
-        node_features[:, 5] = net.res_bus['q_mvar'] / net.sn_mva  # Q / pu
-        # node_features_y[:, 6] = case['bus'][:, 4]  # Gs
-        # node_features_y[:, 7] = case['bus'][:, 5]  # Bs
+            types[index] = 0
+
+        base_node_features = np.zeros((n,6))
+        base_node_features[:,0] = net.bus['name'].values
+        base_node_features[:,1] = types
+        base_node_features[:,2] = net.res_bus['vm_pu']
+        base_node_features[:,3] = net.res_bus['va_degree']
+        base_node_features[:,4] = p_true
+        base_node_features[:,5] = q_true
+
+        # 拼接成完整的节点特征
+        node_g = node_g.reshape(-1, 1)
+        node_b = node_b.reshape(-1, 1)
+        final_node_features = np.concatenate([base_node_features, node_g, node_b], axis=1)
 
         edge_features_list.append(edge_features)
-        node_features_list.append(node_features)
-        # graph_feature_list.append(baseMVA)
+        node_features_list.append(final_node_features)
 
-        if len(edge_features_list) % 10 == 0 or len(edge_features_list) == sublist_size:
-            print(f'[Process {os.getpid()}] Current sample number: {len(edge_features_list)}')
-            
+        if len(edge_features_list) % 100 == 0:
+            print(f'[Process {os.getpid()}] Sample {len(edge_features_list)}')
+
     return edge_features_list, node_features_list
+
 
 def generate_data_parallel(num_samples, num_processes, base_net_create, num_lines_to_remove=0, num_lines_to_add=0):
     sublist_size = num_samples // num_processes
@@ -313,7 +277,7 @@ if __name__ == '__main__':
     if num_lines_to_remove > 0 or num_lines_to_add > 0:
         complete_case_name = 'case' + case + 'perturbed' + f'{num_lines_to_remove:1d}' + 'r' + f'{num_lines_to_add:1d}' + 'a'
     else:
-        complete_case_name = 'case' + case + 'v11'
+        complete_case_name = 'case' + case + '_test'
     base_net = base_net_create()
     base_net.bus['name'] = base_net.bus.index
     print(base_net.bus)

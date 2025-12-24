@@ -50,7 +50,7 @@ def train_epoch(
     # 加载model
     model = model.to(device)
     # 初始loss是0
-    acc = {'total': 0., 'mse_e': 0., 'mse_f': 0., 'phys': 0., 'pv': 0.}
+    acc = {'total': 0., 'mse_e': 0., 'mse_f': 0., 'phys': 0., 'pv': 0. , 'loss_anchor':0., "loss_angle":0.}
 
     num_samples = 0
     # 训练模式
@@ -83,11 +83,12 @@ def train_epoch(
         elif isinstance(loss_fn, MixedMSEPoweImbalance):
             loss = loss_fn(out, data.edge_index, data.edge_attr, data.y)
         elif isinstance(loss_fn,RectangularPureMSELoss):
-            loss = loss_fn(out,data.y,data.pred_mask)
+            loss = loss_fn(out,data.y,data.pred_mask[:,:4])
         elif isinstance(loss_fn,RectangularMixedLoss):
-            loss, l_mse, l_phys, l_pv = loss_fn(
+            loss, l_mse, l_phys, l_pv, l_anchor , l_angle = loss_fn(
                 pred_ef=out, 
                 target_y=data.y, 
+                input_x=data.x,
                 mask=data.pred_mask, 
                 edge_index=data.edge_index, 
                 edge_attr=data.edge_attr, 
@@ -96,6 +97,9 @@ def train_epoch(
             )
             acc['phys'] += l_phys.item() * batch_size
             acc['pv'] += l_pv.item() * batch_size
+            acc['loss_anchor'] += l_anchor.item() * batch_size
+            acc['loss_angle'] += l_angle.item() * batch_size
+
         else:
             loss = loss_fn(out, data.y)
             
@@ -112,7 +116,7 @@ def train_epoch(
 
         with torch.no_grad():
             target_ef = data.y[:,2:]
-            mask_ef = data.pred_mask[:,2:]
+            mask_ef = data.pred_mask[:,2:4]
 
             squared_diff = (out - target_ef) ** 2
             mask_diff = squared_diff * mask_ef

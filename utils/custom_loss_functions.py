@@ -413,57 +413,84 @@ class MixedMSEPoweImbalance(nn.Module):
         
         return loss
 
-# 计算物理引擎
 class RectangularPowerImbalance(MessagePassing):
-    def __init__(self, xymean ,xystd ,edgemean ,edgestd):
-        super().__init__(aggr='add',flow='target_to_source')
+    def __init__(self, xymean, xystd, edgemean, edgestd):
+        super().__init__(aggr='add', flow='target_to_source')
+        
+        # 注册反归一化参数
+        # xymean/std 现在是 6 维: [P, Q, e, f, Gii, Bii]
         self.register_buffer('xymean', xymean)
         self.register_buffer('xystd', xystd)
         self.register_buffer('edgemean', edgemean)
         self.register_buffer('edgestd', edgestd)
 
-    def message(self, x_i,x_j,edge_attr):
-        # 输入 x_i = e , x_j = f
-        e_i, f_i = x_i[:, 0:1], x_i[:, 1:2]
+    def message(self, x_j, edge_attr):
+        """
+        计算互导纳电流: I_ij = Y_ij * V_j
+        """
         e_j, f_j = x_j[:, 0:1], x_j[:, 1:2]
         g_ij, b_ij = edge_attr[:, 0:1], edge_attr[:, 1:2]
+        
+        # 复数乘法 (G + jB) * (e + jf)
+        i_real = g_ij * e_j - b_ij * f_j
+        i_imag = g_ij * f_j + b_ij * e_j
+        
+        return torch.cat([i_real, i_imag], dim=-1)
 
-        # 直角坐标系下的支路功率流公式
-        term1 = e_i * e_j + f_i * f_j
-        term2 = f_i * e_j - e_i * f_j 
-        v_sq = e_i**2 + f_i**2
+    def forward(self, pred_ef, input_pq, edge_index, edge_attr, node_norm_gb):
+        """
+        pred_ef:      [N, 2] 预测的 e, f (物理值, 因为我们强制std=1)
+        input_pq:     [N, 2] 真实的 P, Q (归一化值)
+        node_norm_gb: [N, 2] 真实的 Gii, Bii (归一化值, 来自 data.x[:, 4:])
+        """
         
-        # 计算流出功率
-        P_flow = g_ij * (v_sq - term1) - b_ij * term2
-        Q_flow = -b_ij * (v_sq - term1) - g_ij * term2
-        
-        return torch.cat([P_flow, Q_flow], dim=-1)
-    
-    def forward(self, pred_ef, input_pq, edge_index, edge_attr):
-        # pred_ef 是模型的输出，但是已经是物理值，不需要归一化
-        # input_pq 是真实的值，但是是归一化后的值，需要反归一化
-        # 1. 对于PQ反归一化
-        pq_mean = self.xymean[:,:2]
-        pq_std = self.xystd[:,:2]
+        # --- A. 反归一化 P, Q ---
+        # 对应 xymean 的前两列 [0:2]
+        pq_mean = self.xymean[:, :2]
+        pq_std = self.xystd[:, :2]
         real_pq = input_pq * (pq_std + 1e-7) + pq_mean
-        # 对于 BG 反归一化
+
+        # --- B. 反归一化 边 (Gij, Bij) ---
         real_edge = edge_attr * (self.edgestd + 1e-7) + self.edgemean
 
-        # 处理无向图（变为双向）
-         # 3. 处理无向图 (变为双向)
-        if edge_index.shape[1] > 0:
-            if edge_index[0,0] not in edge_index[1,edge_index[0,:]==edge_index[1,0]]:
-                edge_index_dup = torch.stack([edge_index[1], edge_index[0]], dim=0)
-                edge_index = torch.cat([edge_index, edge_index_dup], dim=1)
-                real_edge = torch.cat([real_edge, real_edge], dim=0)
+        # --- C. 反归一化 节点自导纳 (Gii, Bii) ---
+        # 对应 xymean 的最后两列 [4:6]
+        gb_mean = self.xymean[:, 4:6]
+        gb_std = self.xystd[:, 4:6]
+        real_gb_ii = node_norm_gb * (gb_std + 1e-7) + gb_mean
         
-            # 计算P_calc
-            calc_pq_flow = self.propagate(edge_index , x=pred_ef , edge_attr = real_edge)
-        else : 
-            calc_pq_flow = torch.zeros_like(real_pq)
-        diff = real_pq + calc_pq_flow
+        g_ii, b_ii = real_gb_ii[:, 0:1], real_gb_ii[:, 1:2]
+        e, f = pred_ef[:, 0:1], pred_ef[:, 1:2]
 
-        return diff.pow(2).mean()
+        # --- D. 物理计算 ---
+        
+        # 1. 计算自项电流 I_self = Y_ii * V_i
+        i_self_real = g_ii * e - b_ii * f
+        i_self_imag = g_ii * f + b_ii * e
+        
+        # 2. 聚合邻居电流 I_neigh = Sum(Y_ij * V_j)
+        # 注意：这里不需要再处理双向图翻转，因为 makeYbus 生成的已经是双向的了
+        # 除非你的边索引是单向的。如果 verify 脚本能跑通，说明边是对的。
+        i_neigh = self.propagate(edge_index, x=pred_ef, edge_attr=real_edge)
+        
+        # 3. 总注入电流
+        i_tot_real = i_self_real + i_neigh[:, 0:1]
+        i_tot_imag = i_self_imag + i_neigh[:, 1:2]
+        
+        # 4. 计算功率 S = V * conj(I)
+        # P = Re(V * I*) = e*Ir + f*Ii
+        # Q = Im(V * I*) = f*Ir - e*Ii
+        p_calc = e * i_tot_real + f * i_tot_imag
+        q_calc = f * i_tot_real - e * i_tot_imag
+        
+        # 5. 计算误差
+        # Pandapower 注入定义: P_net = P_gen - P_load (注入)
+        # Ybus 计算定义: P_calc (注入)
+        # 理论上 diff = Target - Calc = 0
+        diff_p = real_pq[:, 0:1] - p_calc
+        diff_q = real_pq[:, 1:2] - q_calc
+        
+        return (diff_p**2 + diff_q**2).mean()
 
 class RectangularPureMSELoss(nn.Module):
     '''
@@ -480,7 +507,7 @@ class RectangularPureMSELoss(nn.Module):
         mask:[N,4]
         '''
         target_ef = target[:,2:]    # 提取对应的e和f
-        mask_ef = mask[:,2:]      # 提取需要预测的e和f
+        mask_ef = mask[:,2:4]      # 提取需要预测的e和f
         squared_diff = (pred - target_ef) ** 2
         masked_loss = squared_diff * mask_ef
 
@@ -488,43 +515,78 @@ class RectangularPureMSELoss(nn.Module):
 
         return  loss
     
+# =========================================================
+# 2. 混合损失主类
+# =========================================================
 class RectangularMixedLoss(nn.Module):
-    def __init__(self, xymean, xystd, edgemean, edgestd, alpha=0.8, beta=0.2, gamma=0.1):
+    def __init__(self, xymean, xystd, edgemean, edgestd, alpha=1.0, beta=0.0, gamma=0.0 , lambda_anchor=0.1 ,lambda_angle = 0):
         super().__init__()
-        self.alpha = alpha  # MSE 权重
-        self.beta = beta    # 物理不平衡 权重
-        self.gamma = gamma  # PV节点电压约束 权重
+        self.alpha = alpha  # MSE
+        self.beta = beta    # Physics
+        self.gamma = gamma  # PV Constraint
+        self.lambda_anchor= lambda_anchor 
+        self.lambda_angle = lambda_angle
 
-        self.mse_loss_fn = RectangularPureMSELoss()
+        self.mse = nn.MSELoss(reduction='none')
+        # self.criterion = nn.L1Loss(reduction='none')
         self.phys_engine = RectangularPowerImbalance(xymean, xystd, edgemean, edgestd)
+        
+        # 缓存用于 PV 约束的反归一化参数 (e, f 的索引是 2:4)
+        self.register_buffer('ef_mean', xymean[:, 2:4])
+        self.register_buffer('ef_std', xystd[:, 2:4])
 
-        self.register_buffer('ef_mean', xymean[:, 2:])
-        self.register_buffer('ef_std', xystd[:, 2:])
-
-    def forward(self, pred_ef, target_y, mask, edge_index, edge_attr, bus_type, target_vm):
-        # 获得纯mse的数值loss
-        loss_mse = self.mse_loss_fn(pred_ef, target_y, mask)
-        # 或得物理一致性损失
+    def forward(self, pred_ef, target_y, input_x, mask, edge_index, edge_attr, bus_type, target_vm):
+        # 1. MSE Loss
+        # 确保 mask 维度匹配 (只取 e, f 部分)
+        target_ef = target_y[:, 2:]
+        mask_ef = mask[:, 2:4]
+        
+        # 基本的mse计算
+        loss_mse = ((pred_ef - target_ef)**2 * mask_ef).sum() / (mask_ef.sum() + 1e-6)
+        
         input_pq = target_y[:, :2]
-        loss_phys = self.phys_engine(pred_ef, input_pq, edge_index, edge_attr)
-        # 节点电压约束（可选）
+        # 提取归一化的 Gii, Bii (input_x 后两列)
+        node_gb = input_x[:, 4:6]
+        
+        # 计算物理loss
+        loss_phys = self.phys_engine(pred_ef, input_pq, edge_index, edge_attr, node_gb)
+
+        # 3. PV Constraint
+        # 反归一化 e, f (防御性代码，虽然 std=1)
         ef_real = pred_ef * (self.ef_std + 1e-7) + self.ef_mean
         vm_sq_pred = ef_real[:, 0]**2 + ef_real[:, 1]**2
         vm_sq_target = target_vm ** 2
 
-        # 只计算 PV 节点 (type=1)
+        # 计算相角的差
+        angle_pred = torch.atan2(pred_ef[:, 1], pred_ef[:,0])
+        angle_true = torch.atan2(target_ef[:, 1], target_ef[:, 0])
+
+        diff_angle = angle_pred - angle_true
+        mask_angle = mask[:, 3]
+
+        loss_angle = (diff_angle**2 * mask_angle).sum() / (mask_angle.sum() + 1e-6)
+
         is_pv = (bus_type == 1)
         if is_pv.any():
             loss_pv = (vm_sq_pred[is_pv] - vm_sq_target[is_pv]).abs().mean()
         else:
             loss_pv = torch.tensor(0.0, device=pred_ef.device)
-            
-        # --- 总损失 ---
-        # 如果 beta=0，就退化为带 PV 约束的 MSE；如果 gamma=0，就是纯 MSE + 物理
-        total_loss = self.alpha * loss_mse + self.beta * loss_phys + self.gamma * loss_pv
 
-        # 返回所有分项，方便打印日志
-        return total_loss, loss_mse, loss_phys, loss_pv
+        is_slack = (bus_type == 0)
+        if is_slack.any():
+            # 预测值 vs 真实值 (target_ef 已经是真实物理值了，如果我们没归一化的话)
+            # 重点约束虚部 f，防止旋转
+            slack_pred = pred_ef[is_slack]
+            slack_target = target_ef[is_slack]
+            
+            # 计算 Slack 节点的 MSE
+            loss_anchor = (slack_pred - slack_target).pow(2).mean()
+        else:
+            loss_anchor = torch.tensor(0.0, device=pred_ef.device)
+            
+        total_loss = self.alpha * loss_mse + self.beta * loss_phys + self.gamma * loss_pv + self.lambda_anchor * loss_anchor + self.lambda_angle * loss_angle
+        
+        return total_loss, loss_mse, loss_phys, loss_pv, loss_anchor ,loss_angle
 
 
 def main():

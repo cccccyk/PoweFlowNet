@@ -1,5 +1,5 @@
 import torch
-from datasets.PowerFlowData_copy import PowerFlowData
+from datasets.PowerFlowData_2 import PowerFlowData
 from networks.MPN import MPN, MPN_simplenet, MaskEmbdMultiMPN
 from utils.custom_loss_functions import Masked_L2_loss
 import time

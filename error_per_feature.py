@@ -13,7 +13,7 @@ import time
 import math
 import pandapower as pp
 
-from datasets.PowerFlowData_copy import PowerFlowData
+from datasets.PowerFlowData_2 import PowerFlowData
 from networks.MPN import MaskEmbdMultiMPN
 from networks.GCN import GCN
 from networks.MLP import MLP

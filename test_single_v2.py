@@ -4,7 +4,7 @@ import numpy as np
 import logging
 
 # 引入你的数据处理和参数解析
-from datasets.PowerFlowData_copy import PowerFlowData
+from datasets.PowerFlowData_2 import PowerFlowData
 from utils.argument_parser import argument_parser
 from utils.evaluation import load_model
 from networks.MPN import MaskEmbdMultiMPN

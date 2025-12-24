@@ -1,9 +1,4 @@
-"""Synthetic Power Flow Data Generator with Pandapower
-Format: 
-    - edge_features: [num_samples, num_edges, 7]
-    - node_features: [num_samples, num_nodes, 6]
-        - index: index of the node, starting from 0
-        - type: 1 for generator, 2 for load
+"""保留一份之前用的BG的数据生成的代码，这份代码没有Yii
 """
 import time
 import argparse
@@ -17,7 +12,7 @@ import os
 from utils.data_utils import perturb_topology
 
 # 生成30000个数据，开10个进程
-number_of_samples = 100
+number_of_samples = 10
 number_of_processes = 10
 ENFORCE_Q_LIMS = False
 

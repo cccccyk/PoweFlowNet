@@ -55,7 +55,7 @@ def evaluate_epoch(model, loader, loss_fn, device, pre_loss_fn=None) -> dict:
     model.eval()
     
     # 累积器
-    acc = {'total': 0., 'mse_e': 0., 'mse_f': 0., 'phys': 0., 'pv': 0.}
+    acc = {'total': 0., 'mse_e': 0., 'mse_f': 0., 'phys': 0., 'pv': 0. ,'loss_anchor':0. ,"loss_angle":0.}
     num_samples = 0
     
     pbar = tqdm(loader, total=len(loader), desc='Evaluating')
@@ -71,9 +71,10 @@ def evaluate_epoch(model, loader, loss_fn, device, pre_loss_fn=None) -> dict:
         # [修改] 适配逻辑同 train_epoch
         # ----------------------------------------------------
         if isinstance(loss_fn, RectangularMixedLoss):
-            loss, l_mse, l_phys, l_pv = loss_fn(
+            loss, l_mse, l_phys, l_pv,l_anchor,l_angle = loss_fn(
                 pred_ef=out, 
                 target_y=data.y, 
+                input_x=data.x,
                 mask=data.pred_mask, 
                 edge_index=data.edge_index, 
                 edge_attr=data.edge_attr, 
@@ -82,9 +83,11 @@ def evaluate_epoch(model, loader, loss_fn, device, pre_loss_fn=None) -> dict:
             )
             acc['phys'] += l_phys.item() * batch_size
             acc['pv'] += l_pv.item() * batch_size
+            acc['loss_anchor'] += l_anchor.item() * batch_size
+            acc['loss_angle'] += l_angle.item() * batch_size
             
         elif isinstance(loss_fn, RectangularPureMSELoss):
-            loss = loss_fn(out, data.y, data.pred_mask)
+            loss = loss_fn(out, data.y, data.pred_mask[:,:4])
             
         else:
             loss = loss_fn(out, data.y)
@@ -93,7 +96,7 @@ def evaluate_epoch(model, loader, loss_fn, device, pre_loss_fn=None) -> dict:
         
         # --- 监控 e, f ---
         target_ef = data.y[:, 2:]
-        mask_ef = data.pred_mask[:, 2:]
+        mask_ef = data.pred_mask[:, 2:4]
         squared = (out - target_ef)**2 * mask_ef
         batch_mse = squared.sum(dim=0) / (mask_ef.sum(dim=0) + 1e-6)
         

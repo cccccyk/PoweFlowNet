@@ -2,209 +2,213 @@ import os
 import logging
 import torch
 import numpy as np
-from functools import partial
-import torch.nn.functional as F
+from torch_geometric.loader import DataLoader
 
-# 引入你的数据和模型定义
-# 注意：确保 PowerFlowData 是修改后的版本 (输出 P, Q, e, f)
+# 导入你的自定义模块
 from datasets.PowerFlowData import PowerFlowData 
-from networks.MPN import (
-    MaskEmbdMultiMPN, 
-    MaskEmbdMultiMPN_NNConv,
-    MaskEmbdMultiMPN_NNConv_v2,
-    MaskEmbdMultiMPN_NNConv_v3,
-    MaskEmbdMultiMPN_Transformer,
-    MaskEmbdMultiMPN_Transformer_Large
-    # ... 其他你用到的模型类
-)
+from networks.MPN import MaskEmbdMultiMPN_GPS
 from utils.evaluation import load_model
 from utils.argument_parser import argument_parser
-from torch_geometric.loader import DataLoader
-from utils.custom_loss_functions import PowerImbalance
 
+# 设置日志
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# 辅助函数：坐标转换
+# 1. 物理辅助函数
 # ==========================================
+
 def rect_to_polar(e, f):
-    """
-    将直角坐标转换为极坐标 (Vm, Va_degree)
-    """
+    """将直角坐标预测值转换为极坐标 (Vm, Va_degree)"""
     vm = torch.sqrt(e**2 + f**2 + 1e-12)
     va_rad = torch.atan2(f, e)
     va_deg = va_rad * (180.0 / torch.pi)
     return vm, va_deg
 
+def compute_branch_flows(e, f, edge_index, edge_attr, baseMVA=100.0):
+    """
+    根据节点电压和 Ybus 边特征计算支路潮流 (P_ij, Q_ij)
+    e, f: 节点电压实部/虚部 [N]
+    edge_index: 边索引 [2, E]
+    edge_attr: Ybus 非对角元 [Gij, Bij]
+    """
+    # 提取 from (i) 和 to (j) 节点的电压
+    e_i, f_i = e[edge_index[0]], f[edge_index[0]]
+    e_j, f_j = e[edge_index[1]], f[edge_index[1]]
+
+    # Ybus 非对角元 Yij = -y_line_ij，所以线路导纳为:
+    g_line = -edge_attr[:, 0]
+    b_line = -edge_attr[:, 1]
+
+    # 计算电压差
+    de = e_i - e_j
+    df = f_i - f_j
+
+    # 计算支路电流 I_ij = y_line * (V_i - V_j)
+    # 复数乘法: (g+jb)*(de+jdf) = (g*de - b*df) + j(g*df + b*de)
+    i_real = g_line * de - b_line * df
+    i_imag = g_line * df + b_line * de
+
+    # 计算支路功率 S_ij = V_i * conj(I_ij)
+    # P = e_i*Ir + f_i*Ii
+    # Q = f_i*Ir - e_i*Ii
+    p_ij = (e_i * i_real + f_i * i_imag) * baseMVA
+    q_ij = (f_i * i_real - e_i * i_imag) * baseMVA
+    
+    return p_ij, q_ij
+
 # ==========================================
-# 核心测试函数
+# 2. 核心评估函数
 # ==========================================
+
 @torch.no_grad()
-def evaluate_metrics(model, loader, device, xymean, xystd):
+def evaluate_full_metrics(model, loader, device, xymean, xystd, edgemean, edgestd):
     model.eval()
     
-    # 累积器
+    # 初始化统计字典
     metrics = {
-        'mse_e': 0., 'mse_f': 0.,
-        'mse_vm': 0., 'mse_va': 0.,
-        'mae_e': 0., 'mae_f': 0.,
+        'num_samples': 0,
+        # 节点电压指标
         'mae_vm': 0., 'mae_va': 0.,
-        'phys_imbalance': 0.
+        'max_err_vm': 0., 'max_err_va': 0.,
+        # 节点直角指标
+        'mae_e': 0., 'mae_f': 0.,
+        'mape_f_reliable': 0.,
+        # 支路潮流指标 (MW/MVAR)
+        'branch_p_mae': 0., 'branch_p_rmse': 0., 'branch_p_max': 0.,
+        'branch_q_mae': 0., 'branch_q_rmse': 0.
     }
-    num_samples = 0
     
-    # 初始化物理计算器 (用于计算 P/Q Imbalance)
-    # 注意：这里的 mean/std 必须和 training 时一致
-    # 假设 PowerImbalance 已经改成了直角坐标版
-    # phys_calc = PowerImbalance(xymean, xystd, None, None).to(device) # edgemean/std 在 forward 里传
-    # 上面这行有点问题，因为 PowerImbalance 需要 edge 的 mean/std
-    # 我们在 main 里初始化它比较好，这里先不初始化
-    ef_mean = xymean[:,2:].to(device)
-    ef_std  = xystd[:,2:].to(device)
-    
+    # 提取反归一化参数 [P, Q, e, f, Gii, Bii]
+    ef_mean = xymean[:, 2:4].to(device)
+    ef_std  = xystd[:, 2:4].to(device)
+    edgemean = edgemean.to(device)
+    edgestd = edgestd.to(device)
+
+    MAPE_THRESHOLD = 1e-2 # 用于过滤 f 的 MAPE 计算
+
     for data in loader:
         data = data.to(device)
-
-        # 输出的是归一化的结果
-        out = model(data) # [N, 2] -> (e, f)
-
-        # label的标签也是归一化的结果
-        target_ef = data.y[:, 2:]
-
-        mask_ef = data.pred_mask[:, 2:] # [N, 2]
-
-        # 指标1，归一化空间下的MSE，可以用于和val_loss和train_loss做比较
-        loss_norm = ((out - target_ef)**2 * mask_ef).sum() / mask_ef.sum()
-        print(f"归一化下的mse={loss_norm}")
-
-        # 指标2：物理空间下的误差
-        # 反归一化
+        out = model(data) # 预测 [N, 2] -> e, f
+        
+        # 1. 反归一化节点电压
+        target_ef = data.y[:, 2:4]
+        mask_ef = data.pred_mask[:, 2:4]
+        
         pred_real = out * (ef_std + 1e-7) + ef_mean
         target_real = target_ef * (ef_std + 1e-7) + ef_mean
-
-        # 计算物理误差
-        diff_ef = (pred_real - target_real) * mask_ef
-        batch_size = data.num_graphs if hasattr(data, 'num_graphs') else 1
         
-        # 2. 计算基础指标 (e, f) - 纯数值
-        # 只计算 mask 部分
-        mse_ef = (diff_ef**2).sum(dim=0) / (mask_ef.sum(dim=0) + 1e-6)
-        mae_ef = diff_ef.abs().sum(dim=0) / (mask_ef.sum(dim=0) + 1e-6)
+        # 2. 计算节点电压 Vm, Va 指标
+        pred_vm, pred_va = rect_to_polar(pred_real[:, 0], pred_real[:, 1])
+        true_vm, true_va = rect_to_polar(target_real[:, 0], target_real[:, 1])
         
-        metrics['mse_e'] += mse_ef[0].item() * batch_size
-        metrics['mse_f'] += mse_ef[1].item() * batch_size
-        metrics['mae_e'] += mae_ef[0].item() * batch_size
-        metrics['mae_f'] += mae_ef[1].item() * batch_size
-        
-        # 3. 计算衍生指标 (Vm, Va) - 物理意义
-        # 先还原成物理值 (假设 e, f 未归一化或已处理，这里根据你的 PowerFlowData 逻辑)
-        # 如果 PowerFlowData 里 e,f 没归一化(mean=0, std=1)，直接用
-        # 如果归一化了，需要反归一化。
-        # 假设：你的 PowerFlowData 现在的 xystd 对于 e,f 是 1.0 (不归一化)
-        
-        pred_e, pred_f = out[:, 0], out[:, 1]
-        true_e, true_f = target_ef[:, 0], target_ef[:, 1]
-        
-        pred_vm, pred_va = rect_to_polar(pred_e, pred_f)
-        true_vm, true_va = rect_to_polar(true_e, true_f)
-        
-        # 计算 Vm, Va 的误差 (只看 PQ 和 PV 节点，Slack 不看)
-        # 简单起见，用 mask_ef[:, 0] 作为节点是否需要预测的标志
-        node_mask = mask_ef[:, 0] 
-        
+        node_mask = mask_ef[:, 0] # 只取待预测节点
         diff_vm = (pred_vm - true_vm) * node_mask
-        # 相角差处理 (处理 180/-180 跳变)
         diff_va = (pred_va - true_va) * node_mask
-        # 简单的去周期化: 使得误差在 -180 到 180 之间
-        diff_va = (diff_va + 180) % 360 - 180
+        diff_va = (diff_va + 180) % 360 - 180 # 角度环路处理
         
-        metrics['mse_vm'] += (diff_vm**2).sum().item() / (node_mask.sum() + 1e-6) * batch_size
-        metrics['mse_va'] += (diff_va**2).sum().item() / (node_mask.sum() + 1e-6) * batch_size
+        m_sum = node_mask.sum().item() + 1e-6
+        batch_size = data.num_graphs
         
-        metrics['mae_vm'] += diff_vm.abs().sum().item() / (node_mask.sum() + 1e-6) * batch_size
-        metrics['mae_va'] += diff_va.abs().sum().item() / (node_mask.sum() + 1e-6) * batch_size
-        
-        num_samples += batch_size
+        metrics['mae_vm'] += (diff_vm.abs().sum().item() / m_sum) * batch_size
+        metrics['mae_va'] += (diff_va.abs().sum().item() / m_sum) * batch_size
+        metrics['max_err_vm'] = max(metrics['max_err_vm'], diff_vm.abs().max().item())
+        metrics['max_err_va'] = max(metrics['max_err_va'], diff_va.abs().max().item())
 
-    # 平均
-    for k in metrics:
-        metrics[k] /= num_samples
+        # 3. 计算节点 e, f 指标
+        diff_ef = (pred_real - target_real) * mask_ef
+        metrics['mae_e'] += (diff_ef[:, 0].abs().sum().item() / m_sum) * batch_size
+        metrics['mae_f'] += (diff_ef[:, 1].abs().sum().item() / m_sum) * batch_size
         
+        # 可靠的 MAPE f (分母大于阈值才计算)
+        f_true_abs = target_real[:, 1].abs()
+        f_mask_reliable = (f_true_abs > MAPE_THRESHOLD) * mask_ef[:, 1]
+        if f_mask_reliable.sum() > 0:
+            mape_f = (diff_ef[:, 1].abs() / (f_true_abs + 1e-8))[f_mask_reliable > 0].mean().item()
+            metrics['mape_f_reliable'] += mape_f * batch_size
+
+        # 4. 支路潮流计算与指标 (P, Q)
+        real_edge_attr = data.edge_attr * (edgestd + 1e-7) + edgemean
+        p_pred, q_pred = compute_branch_flows(pred_real[:,0], pred_real[:,1], data.edge_index, real_edge_attr)
+        p_true, q_true = compute_branch_flows(target_real[:,0], target_real[:,1], data.edge_index, real_edge_attr)
+        
+        err_p = (p_pred - p_true)
+        err_q = (q_pred - q_true)
+        
+        metrics['branch_p_mae'] += err_p.abs().mean().item() * batch_size
+        metrics['branch_p_rmse'] += torch.sqrt((err_p**2).mean()).item() * batch_size
+        metrics['branch_p_max'] = max(metrics['branch_p_max'], err_p.abs().max().item())
+        metrics['branch_q_mae'] += err_q.abs().mean().item() * batch_size
+        metrics['branch_q_rmse'] += torch.sqrt((err_q**2).mean()).item() * batch_size
+
+        metrics['num_samples'] += batch_size
+
+    # 平均化
+    n = metrics['num_samples']
+    for k in metrics:
+        if 'max' not in k and k != 'num_samples':
+            metrics[k] /= n
+            
     return metrics
 
 # ==========================================
-# Main
+# 3. 主程序
 # ==========================================
-@torch.no_grad()
+
 def main():
-    # === 配置 ===
-    run_id = '20251216-4323' # <--- 填入你的新 Run ID
-    # ===========
+    # 这里的 run_id 替换为你保存的模型 ID
+    run_id = '20251222-9778' 
     
     args = argument_parser()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 1. 加载参数
-    data_dir = args.data_dir
-    data_param_path = os.path.join(data_dir, 'params', f'data_params_{run_id}.pt')
-    if not os.path.exists(data_param_path):
-        print(f"Error: Data params not found: {data_param_path}")
-        return
-        
+    # 1. 加载参数与数据
+    data_param_path = os.path.join(args.data_dir, 'params', f'data_params_{run_id}.pt')
     data_param = torch.load(data_param_path, map_location='cpu')
-    # 注意：这里的 mean/std 对应 [P, Q, e, f]
-    xymean, xystd = data_param['xymean'], data_param['xystd']
-    edgemean, edgestd = data_param['edgemean'], data_param['edgestd']
     
-    # 2. 加载数据
-    testset = PowerFlowData(root=data_dir, case=args.case,
+    testset = PowerFlowData(root=args.data_dir, case=args.case,
                             split=[.5, .2, .3], task='test',
-                            xymean=xymean, xystd=xystd,
-                            edgemean=edgemean, edgestd=edgestd)
-    
+                            xymean=data_param['xymean'], xystd=data_param['xystd'],
+                            edgemean=data_param['edgemean'], edgestd=data_param['edgestd'])
     loader = DataLoader(testset, batch_size=args.batch_size, shuffle=False)
     
-    # 3. 加载模型
-    # [关键] 强制输出维度为 2
-    model_cls = MaskEmbdMultiMPN_Transformer_Large # 或者你在 args 里指定的模型
-    
+    # 2. 构建并加载模型
     node_in, _, edge_dim = testset.get_data_dimensions()
-    model = model_cls(
+    model = MaskEmbdMultiMPN_GPS(
         nfeature_dim=node_in,
         efeature_dim=edge_dim,
-        output_dim=2, # <--- 2
+        output_dim=2, # 输出 e, f
         hidden_dim=args.hidden_dim,
         n_gnn_layers=args.n_gnn_layers,
-        K=args.K,
+        nhead=4,
         dropout_rate=args.dropout_rate
     ).to(device)
     
     model, _ = load_model(model, run_id, device)
-    print(f"Loaded model {run_id}")
+    print(f"✅ Loaded GPS Model: {run_id}")
     
-    # 4. 执行测试
-    metrics = evaluate_metrics(model, loader, device, xymean, xystd)
+    # 3. 运行评估
+    res = evaluate_full_metrics(model, loader, device, 
+                                data_param['xymean'], data_param['xystd'],
+                                data_param['edgemean'], data_param['edgestd'])
     
-    # 5. 打印结果
-    print("\n" + "="*40)
-    print(f"Test Results for {args.case} (Rectangular)")
-    print("="*40)
-    print(f"[Direct Output]")
-    print(f"  MSE e : {metrics['mse_e']:.6f}")
-    print(f"  MSE f : {metrics['mse_f']:.6f}")
-    print(f"  MAE e : {metrics['mae_e']:.6f}")
-    print(f"  MAE f : {metrics['mae_f']:.6f}")
+    # 4. 格式化输出
+    print("\n" + "="*50)
+    print(f"📊 Full Evaluation Results: {args.case}")
+    print("="*50)
+    print(f"【Node Voltage (Physical)】")
+    print(f"  MAE Vm : {res['mae_vm']:.6f} p.u. | Max Err: {res['max_err_vm']:.6f}")
+    print(f"  MAE Va : {res['mae_va']:.4f} deg  | Max Err: {res['max_err_va']:.4f}")
     
-    print(f"\n[Derived Physics]")
-    print(f"  MSE Vm: {metrics['mse_vm']:.6f}")
-    print(f"  MAE Vm: {metrics['mae_vm']:.6f}")
-    print(f"  MAE Va: {metrics['mae_va']:.4f} degrees") # 关注这个！
-    print("="*40)
+    print(f"\n【Node Rectangular (Internal)】")
+    print(f"  MAE e  : {res['mae_e']:.6f} | f  : {res['mae_f']:.6f}")
+    print(f"  Reliable MAPE f: {res['mape_f_reliable']*100:.4f}%")
     
-    # 6. (可选) 计算物理不平衡
-    # 需要实例化 Rectangular PowerImbalance 并运行一遍
-    # 这部分逻辑可以复用 evaluate_epoch_v2 或者再写一个循环
-    # 关键看你想不想看 P/Q 的误差
+    print(f"\n【Branch Power Flow (MW/MVAR)】")
+    print(f"  P MAE  : {res['branch_p_mae']:.4f} MW   | RMSE: {res['branch_p_rmse']:.4f}")
+    print(f"  P MAX  : {res['branch_p_max']:.4f} MW   (Critical for N-1!)")
+    print(f"  Q MAE  : {res['branch_q_mae']:.4f} MVAR | RMSE: {res['branch_q_rmse']:.4f}")
+    print("="*50)
 
 if __name__ == "__main__":
     main()

@@ -5,7 +5,7 @@ from functools import partial
 import torch
 import torch_geometric
 
-from datasets.PowerFlowData_copy import PowerFlowData, denormalize
+from datasets.PowerFlowData_2 import PowerFlowData, denormalize
 from networks.MPN import MPN, MPN_simplenet, SkipMPN, MaskEmbdMPN, MultiConvNet, MultiMPN, MaskEmbdMultiMPN
 from utils.evaluation import load_model
 
