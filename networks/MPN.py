@@ -1420,7 +1420,7 @@ class InteractionLayer(MessagePassing):
     """
     def __init__(self, hidden_dim, edge_dim, dropout_rate=0.0):
         super().__init__(aggr='add')
-        
+        # 这一个是处理节点和边的信息的，把节点和边的信息融合还有处理的MLP
         self.message_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim * 2),
             nn.GELU(),
@@ -1432,9 +1432,11 @@ class InteractionLayer(MessagePassing):
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
+        # 归一化
         self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout_rate)
 
+        self.dropout = nn.Dropout(dropout_rate)
+    # 消息拼接的函数
     def message(self, x_i, x_j, edge_attr):
         tmp = torch.cat([x_i, x_j, edge_attr], dim=-1)
         return self.message_mlp(tmp)
@@ -1479,6 +1481,10 @@ class PhysicsGPSLayer(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
+        # 加入门控的参数
+        # 初始化为 0，意味着开始时只信任 GNN，不信任 Transformer
+        # self.attn_gate = nn.Parameter(torch.tensor(0.0))
+
     def forward(self, x, edge_index, edge_attr, batch):
         h = x
         
@@ -1495,7 +1501,9 @@ class PhysicsGPSLayer(nn.Module):
         h_attn = self.dropout(h_attn)
         
         # 3. First Residual Fusion
-        # h = h + Local + Global原始代码
+        # 加入了门控的方式
+        # h = h + h_local + self.attn_gate * h_attn
+        # 原始的加的方法
         h = h + h_local + h_attn
         # 消融实验A
         # h = h + h_attn 
@@ -1512,41 +1520,102 @@ class MaskEmbdMultiMPN_GPS(nn.Module):
     def __init__(self, nfeature_dim, efeature_dim, output_dim, hidden_dim, 
                  n_gnn_layers=4, nhead=4, dropout_rate=0.0, **kwargs):
         super().__init__()
-        
-        # 1. Embedding
-        # 注意: nfeature_dim 自动包含了 PE 的维度 (6 + 8 = 14)
-        self.input_encoder = nn.Linear(nfeature_dim, hidden_dim)
+        '''
+        # 去掉PE编码的版本
+        self.input_dim_no_pe = 6 
+
+        self.input_encoder = nn.Linear(self.input_dim_no_pe, hidden_dim)
         self.mask_embd = nn.Sequential(
-            nn.Linear(nfeature_dim, hidden_dim),
+            nn.Linear(self.input_dim_no_pe, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        
-        # 2. GPS Layers
         self.layers = nn.ModuleList()
         for _ in range(n_gnn_layers):
             self.layers.append(
                 PhysicsGPSLayer(hidden_dim, efeature_dim, nhead, dropout_rate)
             )
-            
         # 3. Decoder (双头输出 e, f 效果更好，也可以用单头)
         self.output_decoder = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, output_dim)
         )
-        # [修改] 删除 self.output_decoder，改为两个独立的头
+        '''
+
+        # node ID embedding
+        # 1. 依然保持不使用 PE 的维度
+        self.input_dim_no_pe = 6  
+        
+        self.input_encoder = nn.Linear(self.input_dim_no_pe, hidden_dim)
+        
+        self.mask_embd = nn.Sequential(
+            nn.Linear(self.input_dim_no_pe, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # ============================================================
+        # 【修改 Step 1.2】: 新增 Node ID Embedding
+        # ============================================================
+        # 给每个节点一个可学习的向量。Case 118 就有 118 个 embedding。
+        self.num_nodes_per_graph = 118
+        self.node_id_emb = nn.Embedding(118, hidden_dim)
+
+        # 2. GPS Layers (保持不变)
+        self.layers = nn.ModuleList()
+        for _ in range(n_gnn_layers):
+            self.layers.append(
+                PhysicsGPSLayer(hidden_dim, efeature_dim, nhead, dropout_rate)
+            )
+            
+        # 3. Heads (保持不变)
         self.head_e = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 1) # 只输出 e
+            nn.Linear(hidden_dim, 1)
         )
-        
         self.head_f = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 1) # 只输出 f
+            nn.Linear(hidden_dim, 1)
         )
+
+        
+        # 保留PE编码的初始版本
+        # 1. Embedding
+        # 注意: nfeature_dim 自动包含了 PE 的维度 (6 + 8 = 14)
+        # self.input_encoder = nn.Linear(nfeature_dim, hidden_dim)
+        # self.mask_embd = nn.Sequential(
+        #     nn.Linear(nfeature_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, hidden_dim)
+        # )
+        # # 2. GPS Layers
+        # self.layers = nn.ModuleList()
+        # for _ in range(n_gnn_layers):
+        #     self.layers.append(
+        #         PhysicsGPSLayer(hidden_dim, efeature_dim, nhead, dropout_rate)
+        #     )
+        # # 3. Decoder (双头输出 e, f 效果更好，也可以用单头)
+        # self.output_decoder = nn.Sequential(
+        #     nn.Linear(hidden_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, output_dim)
+        # )
+        # # [修改] 删除 self.output_decoder，改为两个独立的头
+        # self.head_e = nn.Sequential(
+        #     nn.Linear(hidden_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, 1) # 只输出 e
+        # )
+        
+        # self.head_f = nn.Sequential(
+        #     nn.Linear(hidden_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, 1) # 只输出 f
+        # )
+        
 
 
     def is_directed(self, edge_index):
@@ -1561,7 +1630,47 @@ class MaskEmbdMultiMPN_GPS(nn.Module):
         return edge_index, edge_attr
 
     def forward(self, data):
-        # x 包含了 PE，维度是 14
+        
+        '''
+        # 去掉PE编码，做对比实验
+        x = data.x[:, :6]
+        mask = data.pred_mask.float()[:, :6]
+        '''
+        x = data.x[:, :6]
+        mask = data.pred_mask.float()[:, :6]
+        
+        edge_index, edge_attr = data.edge_index, data.edge_attr
+        batch = data.batch
+        
+        # 2. 基础 Embedding
+        h = self.input_encoder(x) + self.mask_embd(mask)
+        
+        current_batch_size = batch.max().item() + 1
+        
+        ids = torch.arange(self.num_nodes_per_graph, device=x.device)
+        # 自动重复以匹配当前 batch 的总节点数
+        # 为了安全，我们截取或重复到和 x 一样的长度
+        if x.shape[0] % self.num_nodes_per_graph == 0:
+            full_ids = ids.repeat(x.shape[0] // self.num_nodes_per_graph)
+        else:
+            # 防御性代码：万一节点数对不上，就重复到够为止然后截断 (虽然理论上不该发生)
+            full_ids = ids.repeat(x.shape[0] // self.num_nodes_per_graph + 1)[:x.shape[0]]
+            
+        # 叠加 ID Embedding
+        h = h + self.node_id_emb(full_ids)
+
+        # 3. 后续处理 (GPS Layers)
+        edge_index, edge_attr = self.undirect_graph(edge_index, edge_attr)
+        
+        for layer in self.layers:
+            h = layer(h, edge_index, edge_attr, batch)
+            
+        e = self.head_e(h)
+        f = self.head_f(h)
+        out = torch.cat([e, f], dim=-1)
+
+        '''
+        # 保留PE编码，x 包含了 PE，维度是 14
         x, mask = data.x, data.pred_mask.float()
         edge_index, edge_attr = data.edge_index, data.edge_attr
         batch = data.batch
@@ -1575,12 +1684,11 @@ class MaskEmbdMultiMPN_GPS(nn.Module):
             h = layer(h, edge_index, edge_attr, batch)
             
         # Output
-        # out = self.output_decoder(h)
+        out = self.output_decoder(h)
 
-        # [修改] 分别预测
-        e = self.head_e(h)
-        f = self.head_f(h)
-
-        # 拼接回 [N, 2]
-        out = torch.cat([e, f], dim=-1)
+        # 双头预测的方式
+        # e = self.head_e(h)
+        # f = self.head_f(h)
+        # out = torch.cat([e, f], dim=-1)
+        '''
         return out

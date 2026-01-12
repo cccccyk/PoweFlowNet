@@ -98,35 +98,32 @@ def generate_n1_data(sublist_size, rng, base_net_create):
     
     # 统计计数器 (新增 n0_count, n1_count)
     stats = {'safe': 0, 'unsafe': 0, 'failed': 0, 'nan_skip': 0,'n0_count': 0, 'n1_count': 0}
-    N1_RATIO = 0.5 
+    N1_RATIO = 0.4
 
     while len(edge_features_list) < sublist_size:
         net = base_net_create()
         net.bus['name'] = net.bus.index
 
-        scenario = rng.choice(['normal', 'heavy', 'low_voltage'], p=[0.4, 0.4, 0.2])
-        
-        net.gen['vm_pu'] = rng.uniform(1.00, 1.05, len(net.gen))
-        # 把slack的相角锁死了
-        if 'va_degree' in net.ext_grid.columns: net.ext_grid['va_degree'] = 0.0
-        
-        base_pd = net.load['p_mw'].values.copy()
-        base_qd = net.load['q_mvar'].values.copy()
-        
-        if scenario == 'normal':
-            scale = rng.uniform(0.8, 1.2)
-            net.load['p_mw'] = rng.normal(base_pd * scale, 0.05 * np.abs(base_pd))
-            net.load['q_mvar'] = rng.normal(base_qd * scale, 0.05 * np.abs(base_qd))
-        elif scenario == 'heavy':
-            scale = rng.uniform(1.3, 1.6)
-            net.load['p_mw'] = rng.normal(base_pd * scale, 0.05 * np.abs(base_pd))
-            net.load['q_mvar'] = rng.normal(base_qd * scale, 0.05 * np.abs(base_qd))
-        elif scenario == 'low_voltage':
-            scale = rng.uniform(1.2, 1.5)
-            net.load['p_mw'] *= scale
-            net.load['q_mvar'] *= scale
-            net.gen['vm_pu'] = rng.uniform(0.96, 1.00, len(net.gen))
-            net.ext_grid['vm_pu'] = rng.uniform(0.96, 1.00, len(net.ext_grid))
+
+        if 'va_degree' in net.ext_grid.columns: 
+            net.ext_grid['va_degree'] = 0.0
+            net.ext_grid['vm_pu'] = 1.00
+
+        # 1. 负荷缩放: 0.2 ～ 1.0 (鼓励轻载以激发过电压)
+        load_scale = rng.uniform(0.3, 1.0, size=len(net.load))
+        net.load['p_mw'] *= load_scale
+        net.load['q_mvar'] *= load_scale
+
+        # 2. 发电机有功缩放: 0.8 ～ 1.3 (支持重载，减少低压崩溃)
+        gen_p_scale = rng.uniform(0.75, 1.25, size=len(net.gen))
+        net.gen['p_mw'] *= gen_p_scale
+
+        # 3. 发电机 PV 电压设定: 0.95 ～ 1.06 p.u. (直接赋值，非缩放!)
+        net.gen['vm_pu'] = rng.uniform(0.95, 1.05, size=len(net.gen))
+
+        # 4. 外部电网 (Slack) 保持固定
+        net.ext_grid['vm_pu'] = 1.0
+        net.ext_grid['va_degree'] = 0.0
 
         is_n1_scenario = rng.random() < N1_RATIO
         
@@ -155,22 +152,28 @@ def generate_n1_data(sublist_size, rng, base_net_create):
             continue
 
         # ---------------------------------------------------
-        # 4. 统计安全性 (生成 Label)
+        # 4. 统计安全性 (生成 Label) —— 仅 PQ 节点参与高压判断
         # ---------------------------------------------------
         max_load = net.res_line['loading_percent'].max()
-        min_vm = net.res_bus['vm_pu'].min()
-        max_vm = net.res_bus['vm_pu'].max()
-        
-        is_unsafe = (max_load > 100.0) or (min_vm < 0.95) or (max_vm > 1.05)
-        
+        min_vm = net.res_bus['vm_pu'].min()  # 低压：全网最小（合理）
+
+        # ✅ 高压：仅 PQ 节点
+        pv_buses = set(net.gen['bus'].tolist()) | set(net.ext_grid['bus'].tolist())
+        pq_mask = ~net.res_bus.index.isin(pv_buses)
+        pq_vms = net.res_bus.loc[pq_mask, 'vm_pu']
+        max_pq_vm = pq_vms.max() if len(pq_vms) > 0 else -np.inf
+
+        # 判断越限
+        is_v_bad = (min_vm < 0.95) or (max_pq_vm > 1.05)
+        is_l_bad = (max_load > 80.0)
+        is_unsafe = is_v_bad or (max_load > 100.0)
+
+        # 生成标签
         status = 0
-        is_v_bad = (min_vm < 0.95) or (max_vm > 1.05)
-        is_l_bad = (max_load > 100.0)
-        
-        if is_v_bad: status = 1
-        if is_l_bad: 
-            if status == 1: status = 3
-            else: status = 2
+        if is_v_bad:
+            status = 1
+        if is_l_bad:
+            status = 3 if status == 1 else 2
 
         # ---------------------------------------------------
         # 5. 提取特征 & NaN 检查
@@ -261,18 +264,19 @@ def generate_parallel(num_samples, num_proc, base_net_create):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--case', type=str, default='118')
-    parser.add_argument('--samples', type=int, default=30000)
+    parser.add_argument('--samples', type=int, default=300000)
     args = parser.parse_args()
 
     if args.case == '14': base_net = pp.networks.case14
     elif args.case == '118': base_net = pp.networks.case118
+    elif args.case == '300': base_net = pp.networks.case300
     else: raise ValueError("Unknown case")
         
     # 定义文件名
-    case_name = f'case{args.case}v_n1_train'
+    case_name = f'case{args.case}v2_30w_n1'
     print(f"Generating N-1 Training Data for {case_name}...")
     
-    edges, nodes, labels = generate_parallel(args.samples, 10, base_net)
+    edges, nodes, labels = generate_parallel(args.samples, 30, base_net)
     
     os.makedirs("./data/raw", exist_ok=True)
     # 使用 object 类型保存 (因为N-1导致边数不固定)

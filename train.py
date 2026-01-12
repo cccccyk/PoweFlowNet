@@ -218,8 +218,8 @@ def main():
             if epoch < WARMUP_EPOCHS:
                 # 阶段一：Warm-up (纯数据驱动)
                 loss_fn.alpha = 1.0
-                loss_fn.beta = 0.0
-                loss_fn.gamma = 0.0
+                loss_fn.beta = 0
+                loss_fn.gamma = 0
                 loss_fn.lambda_anchor=0.1
                 loss_fn.lambda_angle=0
                 phase_name = "WarmUp"
@@ -227,9 +227,9 @@ def main():
                 # 阶段二：Physics-Informed (加入物理约束)
                 # alpha 降一点，给物理项留空间
                 loss_fn.alpha = 1.0
-                loss_fn.beta = 1e-3  # 物理不平衡权重 (可调)
-                loss_fn.gamma = 0  # PV电压约束权重 (可调)
-                loss_fn.lambda_anchor = 0.1
+                loss_fn.beta = 1e-5  # 物理不平衡权重 (可调)
+                loss_fn.gamma = 1e-4  # PV电压约束权重 (可调)
+                loss_fn.lambda_anchor = 0.01
                 loss_fn.lambda_angle = 0 # 没啥用
                 phase_name = "Physics"
         else:

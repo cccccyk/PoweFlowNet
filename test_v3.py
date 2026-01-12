@@ -119,7 +119,7 @@ def evaluate_full_metrics(model, loader, device, xymean, xystd, edgemean, edgest
                 fn_labels.append(data.label[i].item())
         # 运行结束后打印
         from collections import Counter
-        print(f"漏报样本原始类型分布: {Counter(fn_labels)}")
+        # print(f"漏报样本原始类型分布: {Counter(fn_labels)}")
 
         # 4. 基础误差统计 (原有逻辑)
         node_mask_all = data.pred_mask[:, 2] # 预测掩码
@@ -144,7 +144,7 @@ def evaluate_full_metrics(model, loader, device, xymean, xystd, edgemean, edgest
 # ==========================================
 
 def main():
-    run_id = '20251223-6480' # 修改为你的模型 ID
+    run_id ='20260108-2395' # 修改为你的模型 ID
     args = argument_parser()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     

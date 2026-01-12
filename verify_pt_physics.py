@@ -6,7 +6,7 @@ from torch_geometric.loader import DataLoader
 
 # ================= 配置区域 =================
 # 这里填你生成数据时用的 case 名字 (例如 '118v2' 或 '14v2')
-CASE_NAME = '118v_n1_train' 
+CASE_NAME = '118v1_n1' 
 DATA_ROOT = 'data'
 # ===========================================
 
